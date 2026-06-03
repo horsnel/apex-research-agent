@@ -368,9 +368,10 @@ def truncate_to_token_budget(text: str, max_tokens: int = MAX_SCRAPE_TOKENS) -> 
 async def live_scrape(
     query: str,
     urls: Optional[List[str]] = None,
+    classification: str = "academic",
 ) -> List[ScrapeResult]:
     """
-    Main live scraping function with 3-tier fallback.
+    Main live scraping function with 3-tier fallback + multi-source search.
 
     Strategy:
     1. httpx + BeautifulSoup (always works, no key needed)
@@ -378,7 +379,10 @@ async def live_scrape(
     3. Firecrawl (if FIRECRAWL_API_KEY available — best quality)
 
     For web search (no URLs provided):
-    1. Firecrawl search → Jina search → DuckDuckGo + direct scrape
+    Uses multi-source search router (search_sources.py) which queries
+    13+ sources in parallel: Semantic Scholar, Crossref, OpenAlex, DOAJ,
+    Wikipedia, GitHub, StackOverflow, Hacker News, ClinicalTrials.gov,
+    DuckDuckGo, Brave Search, Serper, Wikidata.
 
     Constraints enforced:
     - Max 3 URLs per query
@@ -388,6 +392,7 @@ async def live_scrape(
     Args:
         query: Search query
         urls: Optional specific URLs to scrape
+        classification: Query type for source routing (academic, web, code, news, clinical)
 
     Returns:
         List of ScrapeResult objects
@@ -401,21 +406,55 @@ async def live_scrape(
         results = list(await asyncio.gather(*tasks))
 
     else:
-        # Search the web for relevant URLs, then scrape them
-        # Try premium search APIs first, fall back to DuckDuckGo
-        search_results = await firecrawl_search(query)
-
-        if not search_results:
-            search_results = await jina_reader_search(query)
-
+        # ── Multi-source search (13+ sources) ──
+        from .search_sources import search_router, SOURCE_FUNCTIONS
+        
+        # Route to appropriate sources based on classification
+        search_results = await search_router(query, classification=classification, max_results=MAX_URLS_PER_QUERY)
+        
         if search_results:
-            results = search_results
-        else:
-            # DuckDuckGo + direct scrape (always works, no key)
+            # Convert SearchResult objects to ScrapeResult
+            # For academic sources, snippets are often rich enough (no scraping needed)
+            for sr in search_results:
+                if sr.snippet and len(sr.snippet) > 100:
+                    # Rich snippet — use directly without scraping
+                    results.append(ScrapeResult(
+                        url=sr.url,
+                        markdown=f"# {sr.title}\n\n{sr.snippet}",
+                        title=sr.title,
+                        success=True,
+                    ))
+                elif sr.url and sr.url.startswith("http"):
+                    # Need to scrape for content
+                    scrape_result = await direct_scrape(sr.url)
+                    if scrape_result.success and scrape_result.markdown and not scrape_result.markdown.startswith("[SCRAPE_FAILED"):
+                        results.append(scrape_result)
+                    elif sr.snippet:
+                        # Fallback to snippet if scraping fails
+                        results.append(ScrapeResult(
+                            url=sr.url,
+                            markdown=f"# {sr.title}\n\n{sr.snippet}",
+                            title=sr.title,
+                            success=True,
+                        ))
+                
+                if len(results) >= MAX_URLS_PER_QUERY:
+                    break
+        
+        # Fallback: DuckDuckGo + direct scrape (always works)
+        if not results:
             search_urls = await duckduckgo_search_urls(query)
             if search_urls:
                 tasks = [direct_scrape(url) for url in search_urls]
                 results = list(await asyncio.gather(*tasks))
+
+        if not results:
+            # Last resort: premium APIs
+            search_results = await firecrawl_search(query)
+            if not search_results:
+                search_results = await jina_reader_search(query)
+            if search_results:
+                results = search_results
 
         if not results:
             logger.warning("No search results from any source. Cannot live scrape.")
