@@ -205,15 +205,38 @@ async def vector_search(
 
     conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
     try:
-        rows = await conn.fetch(
-            "SELECT * FROM search_documents($1::vector, $2, $3, $4, $5, $6)",
-            vector_str,
-            0.5,  # Lower threshold for initial retrieval
-            top_k,
-            domain_filter,
-            tier_filter,
-            doc_type_filter,
-        )
+        # Try the search function first, fall back to inline SQL
+        try:
+            rows = await conn.fetch(
+                "SELECT * FROM search_documents($1::vector, $2, $3, $4, $5, $6)",
+                vector_str,
+                0.5,  # Lower threshold for initial retrieval
+                top_k,
+                domain_filter,
+                tier_filter,
+                doc_type_filter,
+            )
+        except Exception as func_err:
+            logger.warning(f"search_documents function failed ({func_err}), using inline SQL")
+            rows = await conn.fetch(
+                """SELECT id, source_url, source_tier, domain, doc_type, title, authors,
+                          raw_text, metadata, chunk_index, total_chunks,
+                          1 - (content_vector <=> $1::vector) AS similarity
+                   FROM documents
+                   WHERE content_vector IS NOT NULL
+                     AND (1 - (content_vector <=> $1::vector)) >= $2
+                     AND ($4 IS NULL OR domain = $4)
+                     AND ($5 IS NULL OR source_tier = $5)
+                     AND ($6 IS NULL OR doc_type = $6)
+                   ORDER BY content_vector <=> $1::vector
+                   LIMIT $3""",
+                vector_str,
+                0.5,
+                top_k,
+                domain_filter,
+                tier_filter,
+                doc_type_filter,
+            )
 
         chunks = []
         for row in rows:
