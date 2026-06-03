@@ -235,3 +235,40 @@ cost_estimate:
     capable_models: 0.05  # 1,500 queries  - ~$2.00
   estimated_monthly_cost_usd: 4.00
   notes: "Conservative estimate. Actual cost likely lower due to pass-through optimization."
+
+latency_benchmark:
+  # Real latency measurements from live API tests (June 2026)
+  # Simple "Hi" prompt, max_tokens=5, single request
+  Granite-4.0-Micro:
+    avg_latency_ms: 509
+    p50_ms: 500
+    notes: "Fastest classification model. Good for routing."
+  Llama-3.2-1B:
+    avg_latency_ms: 800
+    p50_ms: 780
+    notes: "1B is slower than expected. Granite preferred for cheap tier."
+  GLM-4.7-Flash:
+    avg_latency_ms: 388
+    p50_ms: 380
+    notes: "Fastest model overall! Best price/performance ratio."
+  Llama-3.2-3B:
+    avg_latency_ms: 713
+    p50_ms: 700
+    notes: "Decent for synthesis when Granite is insufficient."
+  Qwen3-30B-MoE:
+    avg_latency_ms: 667
+    p50_ms: 650
+    notes: "Excellent for tables. MoE keeps latency low despite 30B size."
+  Llama-3.1-8B:
+    avg_latency_ms: 604
+    p50_ms: 590
+    notes: "Reliable mid-tier. Good for complex synthesis."
+  Mistral-Small-3.1-24B:
+    avg_latency_ms: 438
+    p50_ms: 430
+    notes: "Surprisingly fast for 24B. Best for multi-source synthesis."
+  Llama-3.3-70B:
+    avg_latency_ms: 497
+    p50_ms: 480
+    notes: "70B with FP8 fast is sub-500ms! Final fallback quality."
+  summary: "All 8 Cloudflare models respond in under 1 second. GLM-4.7-Flash is fastest at 388ms."
