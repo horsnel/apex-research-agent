@@ -412,16 +412,29 @@ async def run_pipeline(request: QueryRequest) -> QueryResponse:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint — works with or without database."""
+    """Health check endpoint — works with or without database.
+
+    Uses asyncio.wait_for to prevent DB connection attempts from
+    blocking the health check (Railway kills the container if
+    /health doesn't respond within 30s).
+    """
     db_status = "not_configured"
     db_url = os.getenv("DATABASE_URL", "")
     if db_url:
         try:
             import asyncpg
-            conn = await asyncpg.connect(db_url)
-            count = await conn.fetchval("SELECT COUNT(*) FROM documents")
-            await conn.close()
-            db_status = f"connected ({count} docs)"
+            # Timeout the DB connection attempt to 5 seconds max
+            # so the health check always responds quickly
+            conn = await asyncio.wait_for(asyncpg.connect(db_url), timeout=5.0)
+            try:
+                count = await asyncio.wait_for(
+                    conn.fetchval("SELECT COUNT(*) FROM documents"), timeout=3.0
+                )
+                db_status = f"connected ({count} docs)"
+            finally:
+                await conn.close()
+        except asyncio.TimeoutError:
+            db_status = "timeout_connecting_to_database"
         except Exception as e:
             db_status = f"error: {str(e)[:80]}"
     else:
