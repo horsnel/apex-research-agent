@@ -412,9 +412,22 @@ async def _call_cloudflare(
                 )
 
             data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            # Some models (e.g. Qwen3 MoE reasoning mode) return None content
+            content = (raw_content or "").strip()
             usage = data.get("usage", {})
             tokens_used = usage.get("total_tokens", 0)
+
+            if not content:
+                return LLMCallResult(
+                    success=False,
+                    content="",
+                    model_name=model_id,
+                    model_id=model_id,
+                    provider="cloudflare",
+                    latency_ms=latency,
+                    error="Empty response (model returned None/empty content)",
+                )
 
             return LLMCallResult(
                 success=True,

@@ -15,7 +15,7 @@ CREATE TABLE documents (
     title TEXT,
     authors TEXT[],
     raw_text TEXT NOT NULL,
-    content_vector VECTOR(1536),
+    content_vector VECTOR(768),
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
@@ -78,7 +78,7 @@ CREATE INDEX idx_query_log_created ON query_log (created_at DESC);
 
 -- ── Helper: cosine similarity search function ──
 CREATE OR REPLACE FUNCTION search_documents(
-    query_vector VECTOR(1536),
+    query_vector VECTOR(768),
     match_threshold FLOAT DEFAULT 0.72,
     match_count INT DEFAULT 5,
     filter_domain TEXT DEFAULT NULL,

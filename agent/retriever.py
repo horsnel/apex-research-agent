@@ -25,10 +25,15 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ──
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://apex:apex_secret@localhost:5432/apex_db")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 COHERE_API_KEY = os.getenv("COHERE_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
-EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "cloudflare")  # "cloudflare" or "openai"
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "@cf/baai/bge-base-en-v1.5")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "768"))
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_EMBEDDING_DIMENSIONS = int(os.getenv("OPENAI_EMBEDDING_DIMENSIONS", "1536"))
 
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 RAG_FINAL_K = int(os.getenv("RAG_FINAL_K", "3"))
@@ -58,10 +63,71 @@ class RetrievedChunk:
     token_count: int = 0
 
 
-async def _get_embedding(query: str) -> List[float]:
-    """Generate embedding for a query string."""
+# Auto-detected CF account ID cache
+_detected_cf_account_id: Optional[str] = None
+
+
+async def _detect_cf_account_id() -> Optional[str]:
+    """Auto-detect Cloudflare Account ID from API token."""
+    global _detected_cf_account_id
+    if _detected_cf_account_id:
+        return _detected_cf_account_id
+    if CLOUDFLARE_ACCOUNT_ID:
+        _detected_cf_account_id = CLOUDFLARE_ACCOUNT_ID
+        return CLOUDFLARE_ACCOUNT_ID
+    if not CLOUDFLARE_API_TOKEN:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(
+                "https://api.cloudflare.com/client/v4/accounts",
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+            )
+            if response.status_code == 200:
+                accounts = response.json().get("result", [])
+                if accounts:
+                    _detected_cf_account_id = accounts[0]["id"]
+                    return _detected_cf_account_id
+    except Exception as e:
+        logger.warning(f"Failed to auto-detect CF Account ID: {e}")
+    return None
+
+
+async def _get_embedding_cloudflare(query: str) -> List[float]:
+    """Generate embedding using Cloudflare Workers AI (primary, free)."""
+    if not CLOUDFLARE_API_TOKEN:
+        return []
+
+    account_id = await _detect_cf_account_id()
+    if not account_id:
+        return []
+
+    base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{base_url}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": EMBEDDING_MODEL,
+                    "input": [query],
+                },
+            )
+            response.raise_for_status()
+            return response.json()["data"][0]["embedding"]
+    except Exception as e:
+        logger.error(f"CF embedding failed: {e}")
+        return []
+
+
+async def _get_embedding_openai(query: str) -> List[float]:
+    """Generate embedding using OpenAI (fallback, paid, may be region-restricted)."""
     if not OPENAI_API_KEY:
-        return [0.0] * EMBEDDING_DIMENSIONS
+        return []
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -72,16 +138,47 @@ async def _get_embedding(query: str) -> List[float]:
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": EMBEDDING_MODEL,
+                    "model": OPENAI_EMBEDDING_MODEL,
                     "input": [query],
-                    "dimensions": EMBEDDING_DIMENSIONS,
+                    "dimensions": OPENAI_EMBEDDING_DIMENSIONS,
                 },
             )
             response.raise_for_status()
             return response.json()["data"][0]["embedding"]
     except Exception as e:
-        logger.error(f"Failed to generate query embedding: {e}")
-        return [0.0] * EMBEDDING_DIMENSIONS
+        logger.error(f"OpenAI embedding failed: {e}")
+        return []
+
+
+async def _get_embedding(query: str) -> List[float]:
+    """Generate embedding for a query string.
+
+    Primary: Cloudflare Workers AI bge-base-en-v1.5 (768 dims, free)
+    Fallback: OpenAI text-embedding-3-small (1536 dims, paid)
+    """
+    if EMBEDDING_PROVIDER == "cloudflare":
+        embedding = await _get_embedding_cloudflare(query)
+        if embedding:
+            return embedding
+        # Try OpenAI fallback
+        if OPENAI_API_KEY:
+            logger.info("CF embedding failed, trying OpenAI fallback")
+            embedding = await _get_embedding_openai(query)
+            if embedding:
+                return embedding
+    else:
+        embedding = await _get_embedding_openai(query)
+        if embedding:
+            return embedding
+        # Try CF fallback
+        if CLOUDFLARE_API_TOKEN:
+            logger.info("OpenAI embedding failed, trying CF fallback")
+            embedding = await _get_embedding_cloudflare(query)
+            if embedding:
+                return embedding
+
+    logger.error("All embedding providers failed. Returning zero vector.")
+    return [0.0] * EMBEDDING_DIMENSIONS
 
 
 async def vector_search(
