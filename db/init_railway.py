@@ -198,7 +198,17 @@ async def init_database():
             )
         """)
         
-        # Create search function if not exists
+        # Drop existing search functions (to handle signature changes)
+        try:
+            await conn.execute("DROP FUNCTION IF EXISTS search_documents CASCADE")
+        except Exception:
+            pass
+        try:
+            await conn.execute("DROP FUNCTION IF EXISTS keyword_search CASCADE")
+        except Exception:
+            pass
+
+        # Create search_documents function
         await conn.execute("""
             CREATE OR REPLACE FUNCTION search_documents(
                 query_vector VECTOR(768),
@@ -244,7 +254,7 @@ async def init_database():
         """)
         logger.info("Created search_documents function")
         
-        # Create keyword_search function if not exists
+        # Create keyword_search function
         await conn.execute("""
             CREATE OR REPLACE FUNCTION keyword_search(
                 search_query TEXT,
