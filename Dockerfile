@@ -38,12 +38,12 @@ USER apex
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# Expose ports
-EXPOSE 8000 8081
+# Railway injects PORT env var — default to 8000 for local dev
+ENV PORT=8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+# Expose the PORT (Railway uses this to route traffic)
+EXPOSE ${PORT}
 
-# Default command: run FastAPI app
-CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Default command: use PORT env var (Railway injects this)
+# Railway auto-assigns a port and proxies all traffic to it
+CMD uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}
