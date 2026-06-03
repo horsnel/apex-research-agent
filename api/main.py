@@ -252,51 +252,65 @@ async def run_pipeline(request: QueryRequest) -> QueryResponse:
     )
 
     start_time = time.time()
-    route = "rag"
+    route = "live"  # Default to live (safe for DB-less mode)
     chunks: list[RetrievedChunk] = []
     scraped_text: Optional[str] = None
     similarity_score: Optional[float] = None
     verification_data = None
 
     # Step 1: Classify
-    if request.force_live:
+    try:
+        if request.force_live:
+            classification = ClassificationResult(
+                route="live",
+                reason="Forced live mode",
+                confidence=1.0,
+                method="override",
+            )
+        else:
+            classification = await classify_query(request.query)
+    except Exception as e:
+        logger.warning(f"Query classification failed, defaulting to live: {e}")
         classification = ClassificationResult(
-            route="live",
-            reason="Forced live mode",
-            confidence=1.0,
-            method="override",
+            route="live", reason=f"classification_error: {str(e)[:50]}",
+            confidence=0.5, method="fallback",
         )
-    else:
-        classification = await classify_query(request.query)
 
     # Step 2: RAG retrieval (always attempt unless forced live-only)
-    if classification.route in ("rag", "live"):
-        chunks, avg_sim = await retrieve(
-            query=request.query,
-            domain_filter=request.domain_filter,
-            tier_filter=request.tier_filter,
-        )
-        similarity_score = avg_sim
+    try:
+        if classification.route in ("rag", "live"):
+            chunks, avg_sim = await retrieve(
+                query=request.query,
+                domain_filter=request.domain_filter,
+                tier_filter=request.tier_filter,
+            )
+            similarity_score = avg_sim
 
-        # Upgrade #3: Enforce source tier by domain
-        for chunk in chunks:
-            chunk.source_tier = enforce_source_tier(chunk.source_url, chunk.source_tier)
+            # Upgrade #3: Enforce source tier by domain
+            for chunk in chunks:
+                chunk.source_tier = enforce_source_tier(chunk.source_url, chunk.source_tier)
 
-        # Check if RAG is sufficient
-        if classification.route == "rag" and not should_escalate_to_live(avg_sim, any(c.source_tier == "P1" for c in chunks)):
-            route = "rag"
-        elif classification.route == "rag" and should_escalate_to_live(avg_sim, any(c.source_tier == "P1" for c in chunks)):
-            route = "rag+live"
-        else:
-            route = "live"
+            # Check if RAG is sufficient
+            if chunks and classification.route == "rag" and not should_escalate_to_live(avg_sim, any(c.source_tier == "P1" for c in chunks)):
+                route = "rag"
+            elif chunks and classification.route == "rag" and should_escalate_to_live(avg_sim, any(c.source_tier == "P1" for c in chunks)):
+                route = "rag+live"
+            else:
+                route = "live"
+    except Exception as e:
+        logger.warning(f"RAG retrieval failed, defaulting to live: {e}")
+        route = "live"
 
     # Step 3: Live scrape fallback
     if route in ("live", "rag+live"):
-        scrape_results = await live_scrape(query=request.query)
-        if scrape_results:
-            successful_results = [r for r in scrape_results if r.success]
-            if successful_results:
-                scraped_text = "\n\n".join(r.markdown for r in successful_results)
+        try:
+            scrape_results = await live_scrape(query=request.query)
+            if scrape_results:
+                successful_results = [r for r in scrape_results if r.success]
+                if successful_results:
+                    scraped_text = "\n\n".join(r.markdown for r in successful_results)
+        except Exception as e:
+            logger.warning(f"Live scrape failed: {e}")
 
     # Step 4: Synthesize
     synthesis = await synthesize(
@@ -352,11 +366,13 @@ async def run_pipeline(request: QueryRequest) -> QueryResponse:
         logger.debug(f"Verification failed (non-critical): {e}")
 
     # Step 6: Validate citations
-    sources_for_validation = [{"url": c.source_url, "tier": c.source_tier, "title": c.title} for c in chunks]
-    validation = validate_citations(synthesis.answer, sources_for_validation)
-
-    # Use corrected text if citations were missing
-    answer = validation.corrected_text if not validation.is_valid else synthesis.answer
+    try:
+        sources_for_validation = [{"url": c.source_url, "tier": c.source_tier, "title": c.title} for c in chunks]
+        validation = validate_citations(synthesis.answer, sources_for_validation)
+        answer = validation.corrected_text if not validation.is_valid else synthesis.answer
+    except Exception as e:
+        logger.debug(f"Citation validation failed (non-critical): {e}")
+        answer = synthesis.answer
 
     # Step 7: Calculate latency
     latency_ms = int((time.time() - start_time) * 1000)

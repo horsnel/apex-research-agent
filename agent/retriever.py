@@ -582,6 +582,9 @@ async def retrieve(
     5. Optional reranking
     6. Token budget enforcement
 
+    If DATABASE_URL is not set or database is unreachable, returns
+    empty results gracefully (live-only mode).
+
     Args:
         query: User query
         top_k: Initial retrieval count
@@ -593,35 +596,57 @@ async def retrieve(
     Returns:
         Tuple of (final chunks, average similarity score)
     """
-    # Step 1: Generate query embedding
-    query_embedding = await _get_embedding(query)
+    # Check if database is available
+    if not DATABASE_URL or DATABASE_URL == "postgresql://apex:apex_secret@localhost:5432/apex_db":
+        # Only skip if env var is not set AND we're not on localhost
+        if not os.getenv("DATABASE_URL"):
+            logger.info("No DATABASE_URL configured — RAG disabled, using live-only mode")
+            return [], 0.0
 
-    # Step 2: Parallel vector + keyword search
-    vector_task = vector_search(query_embedding, top_k, domain_filter, tier_filter)
-    keyword_task = keyword_search(query, top_k, tier_filter)
+    try:
+        # Step 1: Generate query embedding
+        query_embedding = await _get_embedding(query)
 
-    vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
+        # Step 2: Parallel vector + keyword search
+        vector_task = vector_search(query_embedding, top_k, domain_filter, tier_filter)
+        keyword_task = keyword_search(query, top_k, tier_filter)
 
-    # Step 3: Reciprocal Rank Fusion
-    fused = reciprocal_rank_fusion(vector_results, keyword_results)
+        vector_results, keyword_results = await asyncio.gather(
+            vector_task, keyword_task, return_exceptions=True
+        )
 
-    # Step 4: Source hierarchy
-    fused = apply_source_hierarchy(fused)
+        # Handle individual search failures gracefully
+        if isinstance(vector_results, Exception):
+            logger.warning(f"Vector search failed: {vector_results}")
+            vector_results = []
+        if isinstance(keyword_results, Exception):
+            logger.warning(f"Keyword search failed: {keyword_results}")
+            keyword_results = []
 
-    # Step 5: Reranking
-    if use_reranker and COHERE_API_KEY:
-        fused = await rerank_cohere(query, fused, final_k)
-    else:
-        fused = fused[:final_k]
+        # Step 3: Reciprocal Rank Fusion
+        fused = reciprocal_rank_fusion(vector_results, keyword_results)
 
-    # Step 6: Token budget
-    final_chunks = apply_token_budget(fused, MAX_RAG_CONTEXT_TOKENS)
+        # Step 4: Source hierarchy
+        fused = apply_source_hierarchy(fused)
 
-    # Calculate average similarity
-    avg_similarity = (
-        sum(c.similarity_score for c in final_chunks) / len(final_chunks)
-        if final_chunks else 0.0
-    )
+        # Step 5: Reranking
+        if use_reranker and COHERE_API_KEY:
+            fused = await rerank_cohere(query, fused, final_k)
+        else:
+            fused = fused[:final_k]
 
-    logger.info(f"Retrieval complete: {len(final_chunks)} chunks, avg similarity={avg_similarity:.3f}")
-    return final_chunks, avg_similarity
+        # Step 6: Token budget
+        final_chunks = apply_token_budget(fused, MAX_RAG_CONTEXT_TOKENS)
+
+        # Calculate average similarity
+        avg_similarity = (
+            sum(c.similarity_score for c in final_chunks) / len(final_chunks)
+            if final_chunks else 0.0
+        )
+
+        logger.info(f"Retrieval complete: {len(final_chunks)} chunks, avg similarity={avg_similarity:.3f}")
+        return final_chunks, avg_similarity
+
+    except Exception as e:
+        logger.warning(f"RAG retrieval failed, falling back to live-only: {e}")
+        return [], 0.0
