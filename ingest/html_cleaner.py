@@ -43,6 +43,8 @@ AD_CLASS_PATTERNS = [
 
 def _is_ad_element(tag: Tag) -> bool:
     """Check if a tag looks like an ad or boilerplate element."""
+    if not hasattr(tag, 'attrs') or tag.attrs is None:
+        return False
     classes = " ".join(tag.get("class", []))
     tag_id = tag.get("id", "")
     combined = f"{classes} {tag_id}"

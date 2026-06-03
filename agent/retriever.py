@@ -249,7 +249,13 @@ async def rerank_cohere(
     top_n: int = RAG_FINAL_K,
 ) -> List[RetrievedChunk]:
     """
-    Rerank results using Cohere's rerank API.
+    Rerank results using Cohere's rerank API, with CF Workers AI fallback.
+
+    Strategy:
+    1. Cohere rerank (if API key available) — dedicated reranker, best quality
+    2. Cloudflare Workers AI LLM-as-reranker (free, uses your CF token) —
+       asks a small model to score relevance of each chunk
+    3. Fallback to RRF fusion scores if both fail
 
     Args:
         query: Original query
@@ -259,42 +265,138 @@ async def rerank_cohere(
     Returns:
         Reranked list of RetrievedChunk objects
     """
-    if not COHERE_API_KEY or not chunks:
+    if not chunks:
         return chunks[:top_n]
 
+    # Strategy 1: Cohere rerank
+    if COHERE_API_KEY:
+        try:
+            documents = [chunk.raw_text for chunk in chunks]
+
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    "https://api.cohere.ai/v1/rerank",
+                    headers={
+                        "Authorization": f"Bearer {COHERE_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "rerank-english-v3.0",
+                        "query": query,
+                        "documents": documents,
+                        "top_n": top_n,
+                    },
+                )
+                response.raise_for_status()
+                data = response.json()
+
+            reranked = []
+            for result in data["results"]:
+                idx = result["index"]
+                if idx < len(chunks):
+                    chunk = chunks[idx]
+                    chunk.fused_score = result["relevance_score"]
+                    reranked.append(chunk)
+
+            logger.info(f"Cohere rerank: {len(reranked)} results")
+            return reranked
+
+        except Exception as e:
+            logger.warning(f"Cohere rerank failed: {e}. Trying CF AI reranker.")
+
+    # Strategy 2: Cloudflare Workers AI LLM-as-reranker
+    cf_result = await _rerank_with_cloudflare_ai(query, chunks, top_n)
+    if cf_result:
+        return cf_result
+
+    # Strategy 3: Fallback to fusion scores
+    logger.info("All rerankers failed, using RRF fusion scores")
+    return sorted(chunks, key=lambda c: c.fused_score, reverse=True)[:top_n]
+
+
+async def _rerank_with_cloudflare_ai(
+    query: str,
+    chunks: List[RetrievedChunk],
+    top_n: int,
+) -> Optional[List[RetrievedChunk]]:
+    """
+    Use a Cloudflare Workers AI model as a reranker.
+
+    Sends each chunk to a small CF model with a relevance scoring prompt.
+    Uses Granite-4.0-Micro (cheapest) for cost efficiency.
+
+    Returns None if CF AI is not available, so caller can fall through.
+    """
+    CF_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "")
+    CF_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+
+    if not CF_TOKEN:
+        return None
+
+    # Auto-detect account ID if needed
+    if not CF_ACCOUNT_ID:
+        try:
+            from .llm_router import detect_cloudflare_account_id
+            CF_ACCOUNT_ID = await detect_cloudflare_account_id(CF_TOKEN) or ""
+        except Exception:
+            pass
+
+    if not CF_ACCOUNT_ID:
+        return None
+
+    base_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1"
+
     try:
-        documents = [chunk.raw_text for chunk in chunks]
+        # Use Granite for cheap reranking — score each chunk's relevance
+        scored_chunks = []
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                "https://api.cohere.ai/v1/rerank",
-                headers={
-                    "Authorization": f"Bearer {COHERE_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "rerank-english-v3.0",
-                    "query": query,
-                    "documents": documents,
-                    "top_n": top_n,
-                },
-            )
-            response.raise_for_status()
-            data = response.json()
+        for chunk in chunks:
+            prompt = f"""Rate the relevance of this text to the query on a scale of 0.0 to 1.0.
+Respond with ONLY a number, no explanation.
 
-        reranked = []
-        for result in data["results"]:
-            idx = result["index"]
-            if idx < len(chunks):
-                chunk = chunks[idx]
-                chunk.fused_score = result["relevance_score"]
-                reranked.append(chunk)
+Query: {query}
 
+Text: {chunk.raw_text[:500]}
+
+Relevance score:"""
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {CF_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "@cf/ibm-granite/granite-4.0-h-micro",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 10,
+                        "temperature": 0.0,
+                    },
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "0.5")
+                    # Parse score
+                    try:
+                        score = float(re.search(r'[0-9]*\.?[0-9]+', content).group())
+                        score = max(0.0, min(1.0, score))
+                    except (AttributeError, ValueError):
+                        score = chunk.fused_score
+                else:
+                    score = chunk.fused_score
+
+            chunk.fused_score = score
+            scored_chunks.append(chunk)
+
+        reranked = sorted(scored_chunks, key=lambda c: c.fused_score, reverse=True)[:top_n]
+        logger.info(f"CF AI rerank: {len(reranked)} results using Granite")
         return reranked
 
     except Exception as e:
-        logger.warning(f"Cohere rerank failed: {e}. Using fusion scores.")
-        return sorted(chunks, key=lambda c: c.fused_score, reverse=True)[:top_n]
+        logger.warning(f"CF AI rerank failed: {e}")
+        return None
 
 
 def apply_token_budget(
