@@ -1,0 +1,60 @@
+# Ingest Sources Configuration
+# Seed URLs, RSS feeds, and arXiv categories for the weekly ingest pipeline
+
+arxiv_categories:
+  - cs.AI
+  - cs.CL
+  - cs.LG
+  - cs.IR
+  - cs.NE
+  - stat.ML
+  - q-bio.NC
+  - q-bio.QM
+
+pubmed_searches:
+  - query: "large language models"
+    max_results: 50
+  - query: "retrieval augmented generation"
+    max_results: 25
+  - query: "vector database semantic search"
+    max_results: 25
+
+rss_feeds:
+  - name: "AI News - MIT Tech Review"
+    url: "https://www.technologyreview.com/feed/"
+    tier: P2
+    max_articles: 20
+  - name: "Google AI Blog"
+    url: "https://ai.googleblog.com/feeds/posts/default"
+    tier: P2
+    max_articles: 15
+  - name: "OpenAI Blog"
+    url: "https://openai.com/blog/rss.xml"
+    tier: P2
+    max_articles: 15
+  - name: "Anthropic Research"
+    url: "https://www.anthropic.com/feed.xml"
+    tier: P2
+    max_articles: 10
+
+seed_urls:
+  - url: "https://arxiv.org/abs/2312.10997"
+    tier: P1
+    doc_type: paper
+  - url: "https://arxiv.org/abs/2310.06825"
+    tier: P1
+    doc_type: paper
+  - url: "https://arxiv.org/abs/2305.14314"
+    tier: P1
+    doc_type: paper
+
+bulk_csv_paths:
+  # Path to CSV files with columns: url, tier, doc_type
+  # Example: /data/seed_corpus.csv
+  - null
+
+ingest_schedule:
+  weekly_cron: "0 2 * * 0"  # Every Sunday at 02:00 UTC
+  batch_size: 100
+  max_concurrent: 5
+  timeout_per_doc: 30  # seconds

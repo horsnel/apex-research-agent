@@ -1,0 +1,42 @@
+# APEX Research Agent — Python Dependencies
+
+# ── Core Framework ──
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+
+# ── Database ──
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+sqlalchemy[asyncio]==2.0.36
+
+# ── HTTP Clients ──
+httpx==0.28.1
+
+# ── HTML Parsing ──
+beautifulsoup4==4.12.3
+lxml==5.3.0
+
+# ── PDF Processing ──
+PyMuPDF==1.25.1
+
+# ── YAML Config ──
+PyYAML==6.0.2
+
+# ── Environment ──
+python-dotenv==1.0.1
+
+# ── LLM / Embeddings (OpenAI SDK for embeddings) ──
+openai==1.58.1
+
+# ── Testing ──
+pytest==8.3.4
+pytest-asyncio==0.24.0
+httpx  # Also used for test client
+
+# ── MCP ──
+mcp==1.2.0
+
+# ── Utilities ──
+tenacity==9.0.0
+tiktoken==0.8.0

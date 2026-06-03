@@ -1,0 +1,49 @@
+# Trusted Domains Whitelist
+# Domains are categorized by reliability tier (P1=primary, P2=secondary, P3=tertiary)
+
+P1:
+  - arxiv.org
+  - pubmed.ncbi.nlm.nih.gov
+  - nature.com
+  - science.org
+  - nejm.org
+  - lancet.com
+  - dl.acm.org
+  - ieee.org
+  - springer.com
+  - wiley.com
+  - doi.org
+  - semanticscholar.org
+  - openreview.net
+  - biorxiv.org
+  - medrxiv.org
+
+P2:
+  - mit.edu
+  - stanford.edu
+  - harvard.edu
+  - oxford.ac.uk
+  - cam.ac.uk
+  - ethz.ch
+  - nih.gov
+  - nasa.gov
+  - cdc.gov
+  - who.int
+  - nist.gov
+  - europarl.europa.eu
+  - gov.uk
+  - whitehouse.gov
+
+P3:
+  - medium.com
+  - substack.com
+  - wikipedia.org
+  - reddit.com
+  - quora.com
+  - stackoverflow.com
+  - dev.to
+  - hackernoon.com
+
+UNV:
+  # Unverified domains — anything not in the above lists
+  _default: true

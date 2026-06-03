@@ -1,0 +1,86 @@
+# Source Tier Mapping by Domain
+# Maps domain patterns to P1/P2/P3/UNV tiers
+# Used by the query classifier and retriever for source hierarchy enforcement
+
+tiers:
+  P1:
+    description: "Primary — peer-reviewed, institutional, or officially published"
+    max_age_days: null  # No expiry for P1 sources
+    boost_factor: 1.5   # Similarity score multiplier
+    domains:
+      - pattern: "arxiv.org"
+        doc_types: ["paper"]
+      - pattern: "pubmed.ncbi.nlm.nih.gov"
+        doc_types: ["paper", "dataset"]
+      - pattern: "nature.com"
+        doc_types: ["paper", "article"]
+      - pattern: "science.org"
+        doc_types: ["paper", "article"]
+      - pattern: "nejm.org"
+        doc_types: ["paper"]
+      - pattern: "lancet.com"
+        doc_types: ["paper"]
+      - pattern: "dl.acm.org"
+        doc_types: ["paper"]
+      - pattern: "ieee.org"
+        doc_types: ["paper"]
+      - pattern: "springer.com"
+        doc_types: ["paper", "book"]
+      - pattern: "wiley.com"
+        doc_types: ["paper", "book"]
+      - pattern: "semanticscholar.org"
+        doc_types: ["paper"]
+      - pattern: "openreview.net"
+        doc_types: ["paper"]
+      - pattern: "biorxiv.org"
+        doc_types: ["paper"]
+      - pattern: "medrxiv.org"
+        doc_types: ["paper"]
+
+  P2:
+    description: "Secondary — institutional, government, or reputable organization"
+    max_age_days: 365
+    boost_factor: 1.2
+    domains:
+      - pattern: "*.edu"
+        doc_types: ["paper", "article", "report"]
+      - pattern: "*.ac.uk"
+        doc_types: ["paper", "article"]
+      - pattern: "*.ac.jp"
+        doc_types: ["paper"]
+      - pattern: "nih.gov"
+        doc_types: ["paper", "report"]
+      - pattern: "nasa.gov"
+        doc_types: ["paper", "dataset", "report"]
+      - pattern: "cdc.gov"
+        doc_types: ["report", "legal"]
+      - pattern: "who.int"
+        doc_types: ["report", "legal"]
+      - pattern: "nist.gov"
+        doc_types: ["paper", "report"]
+      - pattern: "gov.uk"
+        doc_types: ["legal", "report"]
+
+  P3:
+    description: "Tertiary — community, crowdsourced, or blog content"
+    max_age_days: 180
+    boost_factor: 1.0
+    domains:
+      - pattern: "medium.com"
+        doc_types: ["article"]
+      - pattern: "substack.com"
+        doc_types: ["article"]
+      - pattern: "wikipedia.org"
+        doc_types: ["article"]
+      - pattern: "stackoverflow.com"
+        doc_types: ["article"]
+      - pattern: "reddit.com"
+        doc_types: ["article"]
+
+  UNV:
+    description: "Unverified — no tier assignment, lowest confidence"
+    max_age_days: 90
+    boost_factor: 0.8
+    domains:
+      - pattern: "*"
+        doc_types: ["other"]

@@ -1,0 +1,113 @@
+name: Weekly Ingest Pipeline
+
+on:
+  schedule:
+    # Every Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: apex
+          POSTGRES_PASSWORD: apex_secret
+          POSTGRES_DB: apex_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://apex:apex_secret@localhost:5432/apex_db
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      EMBEDDING_MODEL: text-embedding-3-small
+      EMBEDDING_DIMENSIONS: 1536
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Initialize database schema
+        env:
+          DATABASE_URL: postgresql://apex:apex_secret@localhost:5432/apex_db
+        run: |
+          PGPASSWORD=apex_secret psql -h localhost -U apex -d apex_db -f db/schema.sql
+
+      - name: Ingest arXiv categories
+        run: |
+          python -c "
+          import asyncio
+          from ingest.arxiv_ingest import ingest_arxiv_category
+          categories = ['cs.AI', 'cs.CL', 'cs.LG']
+          for cat in categories:
+              count = asyncio.run(ingest_arxiv_category(cat, max_results=25))
+              print(f'Ingested {count} chunks from {cat}')
+          "
+
+      - name: Ingest PubMed searches
+        run: |
+          python -c "
+          import asyncio
+          from ingest.pubmed_ingest import ingest_pubmed_search
+          queries = ['large language models', 'retrieval augmented generation']
+          for q in queries:
+              count = asyncio.run(ingest_pubmed_search(q, max_results=15))
+              print(f'Ingested {count} chunks from PubMed: {q}')
+          "
+
+      - name: Embed pending chunks
+        run: |
+          python -c "
+          import asyncio
+          from ingest.embedder import embed_unembedded_chunks
+          total = 0
+          while True:
+              count = asyncio.run(embed_unembedded_chunks(batch_size=100))
+              total += count
+              if count == 0:
+                  break
+          print(f'Embedded {total} chunks total')
+          "
+
+      - name: Summary
+        run: |
+          PGPASSWORD=apex_secret psql -h localhost -U apex -d apex_db -c "SELECT COUNT(*) as total_docs, source_tier, domain FROM documents GROUP BY source_tier, domain ORDER BY source_tier, COUNT(*) DESC;"
+
+  # ── Lint and Test ──
+  test:
+    runs-on: ubuntu-latest
+    needs: ingest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
