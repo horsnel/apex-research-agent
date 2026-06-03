@@ -138,16 +138,16 @@ async def init_database():
             except Exception as e:
                 logger.warning(f"Index creation warning: {e}")
         
-        # Create IVFFlat index (only if there are enough rows, or create anyway)
+        # Create HNSW vector index (works with any dataset size, unlike IVFFlat)
         try:
             await conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_documents_content_vector ON documents
-                USING ivfflat (content_vector vector_cosine_ops)
-                WITH (lists = 100)
+                USING hnsw (content_vector vector_cosine_ops)
             """)
-            logger.info("Created vector index")
+            logger.info("Created HNSW vector index")
         except Exception as e:
-            logger.warning(f"Vector index creation warning (may need data first): {e}")
+            logger.warning(f"Vector index creation warning: {e}")
+            logger.info("Vector search will use brute force (fine for small datasets)")
         
         # Create trigram index for BM25-like search
         try:
@@ -232,7 +232,8 @@ async def init_database():
                     d.chunk_index, d.total_chunks,
                     1 - (d.content_vector <=> query_vector) AS similarity
                 FROM documents d
-                WHERE (1 - (d.content_vector <=> query_vector)) >= match_threshold
+                WHERE d.content_vector IS NOT NULL
+              AND (1 - (d.content_vector <=> query_vector)) >= match_threshold
                   AND (filter_domain IS NULL OR d.domain = filter_domain)
                   AND (filter_tier IS NULL OR d.source_tier = filter_tier)
                   AND (filter_doc_type IS NULL OR d.doc_type = filter_doc_type)
