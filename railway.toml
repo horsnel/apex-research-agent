@@ -1,0 +1,17 @@
+# APEX Research Agent — Railway Deployment Config
+# Deploy: railway up
+# Or connect GitHub repo at railway.app
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
+
+# Railway will auto-assign a public URL like:
+# https://apex-research.up.railway.app
+# Set in Railway Dashboard → Settings → Networking

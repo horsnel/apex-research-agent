@@ -59,9 +59,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── CORS: Allow kovira.pages.dev + local dev ──
+ALLOWED_ORIGINS = [
+    "https://kovira.pages.dev",
+    "https://www.kovira.pages.dev",
+    "http://localhost:3000",   # Local Next.js dev
+    "http://localhost:8000",   # Local API docs
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8000",
+]
+# In production, restrict to known origins.
+# Set CORS_WILDCARD=true in .env to allow all (for dev/preview deploys).
+if os.getenv("CORS_WILDCARD", "false").lower() == "true":
+    ALLOWED_ORIGINS = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -382,16 +396,20 @@ async def run_pipeline(request: QueryRequest) -> QueryResponse:
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint."""
-    db_status = "unknown"
-    try:
-        import asyncpg
-        conn = await asyncpg.connect(os.getenv("DATABASE_URL", "postgresql://apex:apex_secret@localhost:5432/apex_db"))
-        count = await conn.fetchval("SELECT COUNT(*) FROM documents")
-        await conn.close()
-        db_status = f"connected ({count} docs)"
-    except Exception as e:
-        db_status = f"error: {str(e)[:50]}"
+    """Health check endpoint — works with or without database."""
+    db_status = "not_configured"
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url:
+        try:
+            import asyncpg
+            conn = await asyncpg.connect(db_url)
+            count = await conn.fetchval("SELECT COUNT(*) FROM documents")
+            await conn.close()
+            db_status = f"connected ({count} docs)"
+        except Exception as e:
+            db_status = f"error: {str(e)[:80]}"
+    else:
+        db_status = "no_database_url_set"
 
     return HealthResponse(status="healthy", version="1.0.0", database=db_status)
 

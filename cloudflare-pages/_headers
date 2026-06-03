@@ -1,0 +1,5 @@
+/research/*
+  Access-Control-Allow-Origin: https://kovira.pages.dev
+  Access-Control-Allow-Methods: GET, POST, OPTIONS
+  Access-Control-Allow-Headers: Content-Type, Authorization
+  X-Proxied-By: kovira-pages-proxy
