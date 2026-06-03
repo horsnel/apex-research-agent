@@ -99,7 +99,7 @@ models:
     provider: "cloudflare"
     model_id: "@cf/qwen/qwen3-30b-a3b-fp8"
     context_window: 32768
-    max_output_tokens: 200
+    max_output_tokens: 4096
     price_input_per_m: 0.051
     price_output_per_m: 0.335
     supports_tools: true
@@ -112,7 +112,7 @@ models:
     provider: "cloudflare"
     model_id: "@cf/meta/llama-3.1-8b-instruct-fp8"
     context_window: 131000
-    max_output_tokens: 300
+    max_output_tokens: 4096
     price_input_per_m: 0.075
     price_output_per_m: 0.300
     supports_tools: true
@@ -125,7 +125,7 @@ models:
     provider: "cloudflare"
     model_id: "@cf/mistralai/mistral-small-3.1-24b-instruct"
     context_window: 128000
-    max_output_tokens: 300
+    max_output_tokens: 4096
     price_input_per_m: 0.351
     price_output_per_m: 0.555
     supports_tools: true
@@ -138,7 +138,7 @@ models:
     provider: "cloudflare"
     model_id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
     context_window: 131000
-    max_output_tokens: 300
+    max_output_tokens: 8192
     price_input_per_m: 0.650
     price_output_per_m: 1.300
     supports_tools: true

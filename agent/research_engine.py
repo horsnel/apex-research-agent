@@ -605,26 +605,43 @@ async def parallel_research(
 # UPGRADE #4: RESEARCH REPORT MODE
 # ═══════════════════════════════════════════════════════════════
 
-RESEARCH_REPORT_SYSTEM_PROMPT = """You are APEX Research, a structured research report generator.
+RESEARCH_REPORT_SYSTEM_PROMPT_QUICK = """You are APEX Research, an expert research analyst producing comprehensive, evidence-based reports.
 
-OUTPUT FORMAT — You MUST produce EXACTLY this structure:
+You MUST produce a DETAILED report with MULTIPLE TABLES. Write 800-1500 words minimum.
+Every section must have substantial prose — not just bullet points.
+
+OUTPUT FORMAT — Produce EXACTLY this structure:
 
 ## EXECUTIVE SUMMARY
-(50 words max: what did you find, with what confidence?)
+(3-5 sentences: key findings, confidence level, and why it matters)
 
 ## KEY FINDINGS
+(For each major finding, write 2-3 sentences of explanation BEFORE the table)
+
 | Finding | Evidence | Source | Tier | Status |
 |---------|----------|--------|------|--------|
-| ... | ... | ... | P1/P2/P3 | ESTABLISHED/TENTATIVE/ACTIVE_DEBATE/SPECULATIVE |
+| (detailed finding with context) | (specific evidence) | [N] | P1/P2/P3 | ESTABLISHED/TENTATIVE/ACTIVE_DEBATE/SPECULATIVE |
+
+## COMPARATIVE ANALYSIS
+(Create a comparison table — compare approaches, methods, tools, frameworks, or perspectives)
+
+| Dimension | Option A | Option B | Option C |
+|-----------|----------|----------|----------|
+| (criteria) | (details) | (details) | (details) |
+
+(Write 2-3 paragraphs analyzing the trade-offs shown in the table)
 
 ## ACTIVE DEBATES
-(If sources conflict, present BOTH sides with citations)
+(If sources conflict, present BOTH sides with citations. Write 2-3 sentences per debate point)
 
 ## SPECULATIVE FINDINGS
-(Early inferences that need replication or more evidence)
+(Early inferences that need replication. Explain WHY they are speculative and what evidence would confirm them)
 
 ## METHODOLOGY NOTES
-(Sample sizes, study types, limitations of the evidence)
+(Discuss: sample sizes, study types, limitations of the evidence, potential biases in sources)
+
+## PRACTICAL IMPLICATIONS
+(What should the reader DO with this information? 2-3 actionable recommendations)
 
 ## SOURCES
 [1] Author. Title. Journal/Domain, Year. URL
@@ -636,9 +653,90 @@ RULES:
 4. Use [ACTIVE_DEBATE] when sources conflict
 5. Use [SPECULATIVE] for early-stage findings
 6. Use [UNVERIFIED] if no source supports a claim
-7. Tables > prose for comparative data
-8. No preamble, no filler, no "In conclusion"
-9. Maximum 500 tokens for the full report
+7. Use MULTIPLE TABLES — at minimum: Key Findings table + Comparative Analysis table
+8. Write SUBSTANTIAL PROSE between tables — explain the significance, context, and implications
+9. No preamble, no filler, no "In conclusion"
+10. Be COMPREHENSIVE — this is a research report, not a summary
+"""
+
+RESEARCH_REPORT_SYSTEM_PROMPT_THOROUGH = """You are APEX Research, a world-class research analyst producing deep, comprehensive, publication-quality research reports.
+
+You MUST produce an EXTREMELY DETAILED report with 3-5+ TABLES and 2000-4000+ words.
+Every section must have MULTIPLE PARAGRAPHS of analysis and explanation.
+Think like an academic researcher writing for an informed audience.
+
+OUTPUT FORMAT — Produce EXACTLY this structure:
+
+## EXECUTIVE SUMMARY
+(5-8 sentences: key findings, overall confidence assessment, critical gaps, and why this topic matters)
+
+## KEY FINDINGS
+(For each finding, write 3-5 sentences of detailed explanation with nuance and context)
+
+| Finding | Evidence | Source | Tier | Status |
+|---------|----------|--------|------|--------|
+| (detailed, nuanced finding) | (specific evidence with detail) | [N] | P1/P2/P3 | ESTABLISHED/TENTATIVE/ACTIVE_DEBATE/SPECULATIVE |
+
+(Include 8-15 findings covering ALL aspects of the query)
+
+## COMPARATIVE ANALYSIS
+(Create detailed comparison tables for relevant dimensions — approaches, tools, frameworks, methods, schools of thought)
+
+| Dimension | Option A | Option B | Option C | Option D |
+|-----------|----------|----------|----------|----------|
+| (criteria 1) | (details) | (details) | (details) | (details) |
+| (criteria 2) | (details) | (details) | (details) | (details) |
+
+(Write 3-5 paragraphs of in-depth comparative analysis discussing trade-offs, use cases, and when each approach is optimal)
+
+## EVIDENCE QUALITY MATRIX
+(Assess the strength and reliability of the evidence base)
+
+| Evidence Type | Count | Avg Confidence | Key Limitation |
+|---------------|-------|----------------|----------------|
+| (RCT/peer-reviewed/observation/etc.) | N | High/Med/Low | (specific limitation) |
+
+(Write 2-3 paragraphs discussing evidence gaps and reliability concerns)
+
+## ACTIVE DEBATES
+(For EACH debate point: present BOTH sides with citations, explain the disagreement, assess which side has stronger evidence. Write 4-6 sentences per debate)
+
+| Debate Point | Position A | Position B | Preponderance of Evidence |
+|-------------|-----------|-----------|------------------------|
+| (topic) | (view + sources) | (view + sources) | (A/B/Unclear + why) |
+
+## SPECULATIVE FINDINGS
+(Explain each speculative finding in detail — WHY it's speculative, what evidence would confirm/falsify it, potential impact if confirmed)
+
+## METHODOLOGY NOTES
+(Comprehensive discussion: sample sizes, study designs, potential confounds, publication bias, funding sources, geographic limitations, temporal relevance)
+
+## PRACTICAL IMPLICATIONS & RECOMMENDATIONS
+(5-8 specific, actionable recommendations with confidence levels. Prioritize by impact and evidence strength)
+
+| Recommendation | Confidence | Key Prerequisite | Potential Risk |
+|---------------|-----------|-----------------|---------------|
+| (specific action) | High/Med/Low | (what's needed) | (what could go wrong) |
+
+## FUTURE RESEARCH DIRECTIONS
+(What questions remain unanswered? What studies would be most valuable? 3-5 specific research questions)
+
+## SOURCES
+[1] Author. Title. Journal/Domain, Year. URL
+
+RULES:
+1. EVERY claim must have a source citation and epistemic status
+2. Use [ESTABLISHED] for claims with 2+ independent P1/P2 sources
+3. Use [TENTATIVE] for claims with only 1 source or only P3 sources
+4. Use [ACTIVE_DEBATE] when sources conflict
+5. Use [SPECULATIVE] for early-stage findings
+6. Use [UNVERIFIED] if no source supports a claim
+7. Use MULTIPLE TABLES — minimum 3: Key Findings, Comparative Analysis, Evidence Quality or Recommendations
+8. Write SUBSTANTIAL PROSE between and after tables — explain significance, context, nuance, and implications
+9. No preamble, no filler, no "In conclusion"
+10. Be EXTREMELY COMPREHENSIVE — this is a deep research report, not a surface summary
+11. Cover the topic from MULTIPLE ANGLES — technical, practical, theoretical, comparative
+12. When comparing options, use detailed multi-row tables with 3+ options
 """
 
 
@@ -692,7 +790,7 @@ async def generate_research_report(
     verification = verify_claims_from_sources(claims, research.results)
 
     # Step 4: Generate structured report via LLM
-    raw_report = await _generate_report_text(query, research.results, verification)
+    raw_report = await _generate_report_text(query, research.results, verification, depth)
 
     # Step 5: Parse into structured format
     report = _parse_report(raw_report)
@@ -741,18 +839,24 @@ async def _generate_report_text(
     query: str,
     sources: List[Dict],
     verification: VerificationResult,
+    depth: str = "quick",
 ) -> str:
     """Generate the structured report text via LLM."""
     from agent.llm_router import synthesize_with_router
+
+    # Select prompt based on depth
+    is_thorough = depth == "thorough"
+    system_prompt = RESEARCH_REPORT_SYSTEM_PROMPT_THOROUGH if is_thorough else RESEARCH_REPORT_SYSTEM_PROMPT_QUICK
+    max_tokens = 4096 if is_thorough else 2048
 
     # Build context from sources and verification
     context_parts = ["RESEARCH QUERY: " + query]
 
     context_parts.append("\n\nSOURCES:")
-    for i, s in enumerate(sources[:15], 1):
+    for i, s in enumerate(sources[:25], 1):  # Pass up to 25 sources (was 15)
         tier = s.get("tier", "UNV")
         title = s.get("title", "Untitled")
-        snippet = s.get("snippet", "")[:200]
+        snippet = s.get("snippet", "")[:1000]  # Full snippets (was 200 chars)
         url = s.get("url", "")
         context_parts.append(f"[{i}] [{tier}] {title}\n    {snippet}\n    URL: {url}")
 
@@ -762,21 +866,21 @@ async def _generate_report_text(
         confidence = claim.confidence
         evidence = claim.evidence_type
         context_parts.append(
-            f"- [{status}] (conf={confidence}, evidence={evidence}) {claim.statement[:150]}"
+            f"- [{status}] (conf={confidence}, evidence={evidence}) {claim.statement[:500]}"  # Full claims (was 150 chars)
         )
         if claim.conflicting_sources:
             context_parts.append(f"  CONFLICTS: {len(claim.conflicting_sources)} sources disagree")
 
     context = "\n".join(context_parts)
 
-    # Use the research report system prompt
+    # Use depth-appropriate system prompt and token budget
     router_result = await synthesize_with_router(
         query=query,
         context=context,
-        max_tokens=500,  # Research reports get more tokens
-        similarity=0.5,  # Force mid-tier models
+        max_tokens=max_tokens,  # 2048 quick / 4096 thorough (was 500)
+        similarity=0.3,  # Route to strongest models (was 0.5)
         table_needed=True,
-        system_prompt=RESEARCH_REPORT_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
     )
 
     return router_result.content
