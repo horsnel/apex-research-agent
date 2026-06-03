@@ -204,11 +204,12 @@ class HealthResponse(BaseModel):
 class ResearchRequest(BaseModel):
     """Deep research request with structured report output."""
     query: str = Field(..., min_length=1, max_length=2000, description="Research query")
-    classification: str = Field("academic", description="Query type: academic, web, code, news, clinical, encyclopedia, compute, patent")
+    classification: str = Field("web", description="Query type: academic, web, code, news, clinical, encyclopedia, compute, patent")
     depth: str = Field("quick", pattern=r"^(quick|thorough)$", description="Research depth: quick (1 cycle) or thorough (iterative)")
     verify: bool = Field(True, description="Verify claims with epistemic marking")
     extract: bool = Field(False, description="Extract structured claims from P1 sources")
     check_retractions: bool = Field(False, description="Check DOIs for retraction status")
+    force_live: bool = Field(True, description="Force live scraping bypass (skips RAG, use when DB is unavailable)")
 
 
 class ResearchResponse(BaseModel):

@@ -203,7 +203,7 @@ async def vector_search(
     """
     vector_str = "[" + ",".join(str(v) for v in query_embedding) + "]"
 
-    conn = await asyncpg.connect(DATABASE_URL)
+    conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
     try:
         rows = await conn.fetch(
             "SELECT * FROM search_documents($1::vector, $2, $3, $4, $5, $6)",
@@ -257,7 +257,7 @@ async def keyword_search(
     Returns:
         List of RetrievedChunk objects sorted by keyword relevance
     """
-    conn = await asyncpg.connect(DATABASE_URL)
+    conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
     try:
         rows = await conn.fetch(
             "SELECT * FROM keyword_search($1, $2, $3)",
@@ -575,15 +575,15 @@ async def retrieve(
     """
     Full hybrid retrieval pipeline.
 
+    Gracefully returns empty results if the database is unavailable,
+    allowing the caller to fall back to live scraping.
+
     1. Generate query embedding
     2. Vector search + keyword search in parallel
     3. Reciprocal Rank Fusion
     4. Source hierarchy enforcement
     5. Optional reranking
     6. Token budget enforcement
-
-    If DATABASE_URL is not set or database is unreachable, returns
-    empty results gracefully (live-only mode).
 
     Args:
         query: User query
@@ -596,13 +596,6 @@ async def retrieve(
     Returns:
         Tuple of (final chunks, average similarity score)
     """
-    # Check if database is available
-    if not DATABASE_URL or DATABASE_URL == "postgresql://apex:apex_secret@localhost:5432/apex_db":
-        # Only skip if env var is not set AND we're not on localhost
-        if not os.getenv("DATABASE_URL"):
-            logger.info("No DATABASE_URL configured — RAG disabled, using live-only mode")
-            return [], 0.0
-
     try:
         # Step 1: Generate query embedding
         query_embedding = await _get_embedding(query)
@@ -611,17 +604,7 @@ async def retrieve(
         vector_task = vector_search(query_embedding, top_k, domain_filter, tier_filter)
         keyword_task = keyword_search(query, top_k, tier_filter)
 
-        vector_results, keyword_results = await asyncio.gather(
-            vector_task, keyword_task, return_exceptions=True
-        )
-
-        # Handle individual search failures gracefully
-        if isinstance(vector_results, Exception):
-            logger.warning(f"Vector search failed: {vector_results}")
-            vector_results = []
-        if isinstance(keyword_results, Exception):
-            logger.warning(f"Keyword search failed: {keyword_results}")
-            keyword_results = []
+        vector_results, keyword_results = await asyncio.gather(vector_task, keyword_task)
 
         # Step 3: Reciprocal Rank Fusion
         fused = reciprocal_rank_fusion(vector_results, keyword_results)
@@ -648,5 +631,5 @@ async def retrieve(
         return final_chunks, avg_similarity
 
     except Exception as e:
-        logger.warning(f"RAG retrieval failed, falling back to live-only: {e}")
+        logger.warning(f"RAG retrieval failed (DB likely unavailable): {e}. Returning empty results for live fallback.")
         return [], 0.0
