@@ -206,6 +206,7 @@ async def vector_search(
     conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
     try:
         # Use inline SQL for vector search (avoids function signature issues)
+        # Cast NULL params to their types so PostgreSQL can infer them
         rows = await conn.fetch(
             """SELECT id, source_url, source_tier, domain, doc_type, title, authors,
                       raw_text, metadata, chunk_index, total_chunks,
@@ -213,9 +214,9 @@ async def vector_search(
                FROM documents
                WHERE content_vector IS NOT NULL
                  AND (1 - (content_vector <=> $1::vector)) >= $2
-                 AND ($4 IS NULL OR domain = $4)
-                 AND ($5 IS NULL OR source_tier = $5)
-                 AND ($6 IS NULL OR doc_type = $6)
+                 AND ($4::text IS NULL OR domain = $4::text)
+                 AND ($5::text IS NULL OR source_tier = $5::text)
+                 AND ($6::text IS NULL OR doc_type = $6::text)
                ORDER BY content_vector <=> $1::vector
                LIMIT $3""",
             vector_str,
@@ -276,7 +277,7 @@ async def keyword_search(
                       ts_rank(tsv, plainto_tsquery('english', $1)) AS rank
                FROM documents
                WHERE tsv @@ plainto_tsquery('english', $1)
-                 AND ($3 IS NULL OR source_tier = $3)
+                 AND ($3::text IS NULL OR source_tier = $3::text)
                ORDER BY rank DESC
                LIMIT $2""",
             query,
