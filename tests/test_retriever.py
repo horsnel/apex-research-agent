@@ -470,6 +470,101 @@ class TestLiveScraper:
         assert result.rstrip().endswith(".") or len(result) < len(text)
 
 
+# ── LLM Router Tests ──
+
+from agent.llm_router import (
+    FALLBACK_CHAIN,
+    ModelConfig,
+    Provider,
+    select_tier,
+    get_router_status,
+    RouterResult,
+)
+
+
+class TestFallbackChain:
+    """Tests for the 9-model fallback chain configuration."""
+
+    def test_chain_has_9_models(self):
+        assert len(FALLBACK_CHAIN) == 9
+
+    def test_first_model_is_passthrough(self):
+        assert FALLBACK_CHAIN[0].provider == Provider.PASSTHROUGH
+
+    def test_cloudflare_models_present(self):
+        cf_models = [m for m in FALLBACK_CHAIN if m.provider == Provider.CLOUDFLARE]
+        assert len(cf_models) == 4  # Granite, GLM-4.7, Qwen3, Mistral-Small
+
+    def test_github_models_present(self):
+        gh_models = [m for m in FALLBACK_CHAIN if m.provider == Provider.GITHUB]
+        assert len(gh_models) == 4  # Phi-4-mini, Mistral-Nemo, GPT-4o-mini, DeepSeek-V3
+
+    def test_models_ordered_cheapest_first(self):
+        # Non-passthrough models should generally increase in price
+        priced = [m for m in FALLBACK_CHAIN[1:] if m.price_output_per_m > 0]
+        # First model should be cheaper than last
+        assert priced[0].price_output_per_m <= priced[-1].price_output_per_m
+
+    def test_all_models_have_required_fields(self):
+        for m in FALLBACK_CHAIN:
+            assert m.name
+            assert m.model_id
+            assert m.context_window > 0 or m.provider == Provider.PASSTHROUGH
+            assert m.tier in ("free", "cheap", "mid", "capable", "cloud")
+
+
+class TestTierSelection:
+    """Tests for model tier selection logic."""
+
+    def test_high_similarity_returns_passthrough(self):
+        models = select_tier(similarity=0.90)
+        assert any(m.provider == Provider.PASSTHROUGH for m in models)
+
+    def test_low_similarity_returns_more_models(self):
+        low_sim = select_tier(similarity=0.50)
+        mid_sim = select_tier(similarity=0.78)
+        assert len(low_sim) >= len(mid_sim)
+
+    def test_table_needed_excludes_cheap(self):
+        models = select_tier(table_needed=True)
+        for m in models:
+            assert m.tier in ("mid", "capable", "cloud")
+
+    def test_classification_uses_cheap_models(self):
+        models = select_tier(is_classification=True)
+        for m in models:
+            assert m.tier in ("cheap", "free")
+
+    def test_force_model_returns_specific_model(self):
+        models = select_tier(force_model="GLM-4.7-Flash")
+        assert len(models) == 1
+        assert models[0].name == "GLM-4.7-Flash"
+
+    def test_force_nonexistent_returns_passthrough(self):
+        models = select_tier(force_model="nonexistent-model")
+        assert len(models) == 0 or models[0].provider == Provider.PASSTHROUGH
+
+
+class TestRouterStatus:
+    """Tests for router status reporting."""
+
+    def test_status_returns_dict(self):
+        status = get_router_status()
+        assert isinstance(status, dict)
+        assert "total_models" in status
+        assert "models" in status
+        assert status["total_models"] == 9
+
+    def test_status_shows_all_models(self):
+        status = get_router_status()
+        assert len(status["models"]) == 9
+
+    def test_status_shows_provider_config(self):
+        status = get_router_status()
+        assert "cloudflare_configured" in status
+        assert "github_configured" in status
+
+
 # ── Integration Test Markers ──
 
 @pytest.mark.asyncio
@@ -485,6 +580,11 @@ class TestAsyncComponents:
         from agent.query_classifier import classify_query
         result = await classify_query("What is the latest AI news today?")
         assert result.route == "live"
+
+    async def test_classify_result_has_model_field(self):
+        from agent.query_classifier import classify_rules
+        result = classify_rules("What is RAG?")
+        assert hasattr(result, "model_used")
 
 
 if __name__ == "__main__":

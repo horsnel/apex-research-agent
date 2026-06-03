@@ -1,9 +1,10 @@
 """
 Query Classifier — routes queries to RAG or live scraper.
 
-Uses a two-stage approach:
+Uses a three-stage approach:
 1. Rule-based fast path (zero LLM cost)
-2. LLM fallback for ambiguous queries
+2. LLM fallback via the 9-model router (Cloudflare → GitHub)
+3. Similarity-based escalation after RAG retrieval
 
 Output: {"route": "rag" | "live", "reason": "...", "domain_hint": "..."}
 """
@@ -17,11 +18,11 @@ from typing import Optional
 
 import httpx
 
+from .llm_router import classify_with_router
+
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", "0.72"))
 
 # ── Rule patterns ──
@@ -54,7 +55,8 @@ class ClassificationResult:
     reason: str
     domain_hint: str = ""
     confidence: float = 1.0
-    method: str = "rules"  # "rules" or "llm"
+    method: str = "rules"  # "rules", "llm", "rules+similarity"
+    model_used: str = ""
 
 
 def classify_rules(query: str) -> ClassificationResult:
@@ -113,9 +115,10 @@ def classify_rules(query: str) -> ClassificationResult:
 
 async def classify_llm(query: str) -> ClassificationResult:
     """
-    LLM-based query classification for ambiguous queries.
+    LLM-based query classification using the 9-model fallback router.
 
-    Uses a lightweight model (GPT-4o-mini) to determine routing.
+    Tries cheapest models first (Cloudflare Granite → GLM-4.7-Flash),
+    falls back to GitHub Models if Cloudflare is unavailable.
 
     Args:
         query: User query string
@@ -123,51 +126,16 @@ async def classify_llm(query: str) -> ClassificationResult:
     Returns:
         ClassificationResult
     """
-    system_prompt = """You are a query router for a research AI. Classify the query as needing:
-- "rag": if it can likely be answered from a pre-loaded academic/research corpus
-- "live": if it needs current/real-time data from the web
+    result = await classify_with_router(query)
 
-Respond ONLY with valid JSON: {"route": "rag"|"live", "reason": "...", "domain_hint": "..."}"""
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": query},
-                    ],
-                    "max_tokens": 50,
-                    "temperature": 0,
-                },
-            )
-            response.raise_for_status()
-            content = response.json()["choices"][0]["message"]["content"].strip()
-
-            # Parse JSON from response
-            # Handle possible markdown code blocks
-            if content.startswith("```"):
-                content = re.sub(r"^```(?:json)?\s*", "", content)
-                content = re.sub(r"\s*```$", "", content)
-
-            result = json.loads(content)
-            return ClassificationResult(
-                route=result.get("route", "rag"),
-                reason=result.get("reason", "LLM classified"),
-                domain_hint=result.get("domain_hint", ""),
-                confidence=0.8,
-                method="llm",
-            )
-
-    except Exception as e:
-        logger.warning(f"LLM classification failed: {e}. Falling back to rules.")
-        return classify_rules(query)
+    return ClassificationResult(
+        route=result.get("route", "rag"),
+        reason=result.get("reason", "LLM classified"),
+        domain_hint=result.get("domain_hint", ""),
+        confidence=0.8,
+        method="llm",
+        model_used=result.get("model_used", ""),
+    )
 
 
 async def classify_query(
@@ -179,7 +147,7 @@ async def classify_query(
 
     Decision flow:
     1. Rule-based fast path
-    2. If low confidence AND similarity is below threshold -> try LLM
+    2. If low confidence AND similarity is below threshold -> try LLM router
     3. If RAG avg similarity < 0.72 after retrieval -> escalate to live
 
     Args:
@@ -202,8 +170,8 @@ async def classify_query(
         )
         return result
 
-    # Stage 3: LLM fallback for ambiguous rules-based results
-    if result.confidence < 0.6 and OPENAI_API_KEY:
+    # Stage 3: LLM fallback via 9-model router for ambiguous rules-based results
+    if result.confidence < 0.6:
         result = await classify_llm(query)
 
     logger.info(f"Query classified: route={result.route}, method={result.method}, reason={result.reason}")

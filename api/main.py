@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.query_classifier import classify_query, ClassificationResult, should_escalate_to_live
 from agent.retriever import retrieve, RetrievedChunk
 from agent.synthesizer import synthesize, SynthesisResult
+from agent.llm_router import get_router_status, FALLBACK_CHAIN
 from tools.live_scraper import live_scrape, ScrapeResult
 from tools.citation_validator import validate_citations, ValidationResult
 from ingest.chunker import chunk_text
@@ -90,6 +91,9 @@ class QueryResponse(BaseModel):
     latency_ms: int
     similarity_score: Optional[float] = None
     validation: Optional[dict] = None
+    model_used: str = ""
+    provider: str = ""
+    fallback_count: int = 0
 
 
 class IngestURLRequest(BaseModel):
@@ -277,6 +281,9 @@ async def run_pipeline(request: QueryRequest) -> QueryResponse:
             "cited_claims": validation.cited_claims,
             "warnings": validation.warnings,
         },
+        model_used=synthesis.model_used,
+        provider=synthesis.provider,
+        fallback_count=synthesis.fallback_count,
     )
 
 
@@ -503,6 +510,40 @@ async def embed_pending():
         return {"status": "success", "embedded": count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Embedding failed: {e}")
+
+
+@app.get("/router/status")
+async def router_status():
+    """Get the status of all 9 models in the LLM fallback chain."""
+    return get_router_status()
+
+
+@app.get("/router/chain")
+async def router_chain():
+    """Get the full fallback chain configuration."""
+    return {
+        "fallback_order": [
+            {
+                "position": i + 1,
+                "name": m.name,
+                "provider": m.provider.value,
+                "model_id": m.model_id,
+                "tier": m.tier,
+                "price_input_per_m": m.price_input_per_m,
+                "price_output_per_m": m.price_output_per_m,
+                "context_window": m.context_window,
+                "supports_tools": m.supports_tools,
+            }
+            for i, m in enumerate(FALLBACK_CHAIN)
+        ],
+        "tier_selection": {
+            "similarity_gt_0.85": "pass-through (no LLM)",
+            "similarity_0.72_0.85": "Granite-4.0 → GLM-4.7 → Qwen3-30B → Mistral-24B",
+            "similarity_lt_0.72": "Full 9-model chain up to DeepSeek-V3",
+            "table_queries": "Mid + capable models only",
+            "classification": "Cheapest configured model",
+        },
+    }
 
 
 # ── MCP Mount ──

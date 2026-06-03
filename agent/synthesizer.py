@@ -8,6 +8,12 @@ Core principles:
 4. Every claim must have inline citation [Source, Tier] or [UNVERIFIED].
 5. No reasoning emitted: Internal chain-of-thought stays internal.
 6. If a tool result directly answers the query, emit it verbatim with ≤5 words of framing.
+
+Uses the 9-model fallback router:
+- similarity > 0.85 → Pass-through (no LLM call at all)
+- similarity 0.72-0.85 → Cloudflare cheap models (Granite, GLM-4.7)
+- similarity < 0.72 → Full fallback chain up to DeepSeek-V3
+- Table queries → Mid+ capable models only
 """
 
 import json
@@ -19,13 +25,12 @@ from typing import List, Optional
 
 import httpx
 
+from .llm_router import synthesize_with_router, RouterResult
 from .retriever import RetrievedChunk
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ──
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 DEFAULT_SYNTHESIS_TOKENS = int(os.getenv("DEFAULT_SYNTHESIS_TOKENS", "150"))
 MAX_SYNTHESIS_TOKENS = int(os.getenv("MAX_SYNTHESIS_TOKENS", "300"))
 
@@ -53,7 +58,10 @@ class SynthesisResult:
     answer: str
     token_count: int
     sources_used: List[dict]
-    method: str  # "pass_through", "synthesis", "table"
+    method: str  # "pass_through", "synthesis", "table", "raw_context"
+    model_used: str = ""
+    provider: str = ""
+    fallback_count: int = 0
 
 
 def _format_citation(chunk: RetrievedChunk) -> str:
@@ -138,93 +146,6 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text.split()))
 
 
-async def synthesize_openai(
-    query: str,
-    context: str,
-    max_tokens: int = DEFAULT_SYNTHESIS_TOKENS,
-) -> str:
-    """
-    Synthesize an answer using OpenAI's API.
-
-    Args:
-        query: User query
-        context: Formatted context string
-        max_tokens: Maximum output tokens
-
-    Returns:
-        Synthesized answer string
-    """
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [
-                        {"role": "system", "content": APEX_SYSTEM_PROMPT},
-                        {"role": "user", "content": f"Query: {query}\n\nContext:\n{context}"},
-                    ],
-                    "max_tokens": max_tokens,
-                    "temperature": 0,
-                },
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"].strip()
-
-    except Exception as e:
-        logger.error(f"OpenAI synthesis failed: {e}")
-        return f"[SYNTHESIS_ERROR] {str(e)}"
-
-
-async def synthesize_anthropic(
-    query: str,
-    context: str,
-    max_tokens: int = DEFAULT_SYNTHESIS_TOKENS,
-) -> str:
-    """
-    Synthesize an answer using Anthropic's API.
-
-    Args:
-        query: User query
-        context: Formatted context string
-        max_tokens: Maximum output tokens
-
-    Returns:
-        Synthesized answer string
-    """
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": ANTHROPIC_API_KEY,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "claude-3-5-sonnet-20241022",
-                    "max_tokens": max_tokens,
-                    "system": APEX_SYSTEM_PROMPT,
-                    "messages": [
-                        {"role": "user", "content": f"Query: {query}\n\nContext:\n{context}"},
-                    ],
-                },
-            )
-            response.raise_for_status()
-            return response.json()["content"][0]["text"].strip()
-
-    except Exception as e:
-        logger.error(f"Anthropic synthesis failed: {e}")
-        # Fallback to OpenAI
-        if OPENAI_API_KEY:
-            return await synthesize_openai(query, context, max_tokens)
-        return f"[SYNTHESIS_ERROR] {str(e)}"
-
-
 def _detect_table_needed(query: str, chunks: List[RetrievedChunk]) -> bool:
     """
     Detect if the query requires a table (comparative/multi-item).
@@ -261,9 +182,10 @@ async def synthesize(
 
     Decision flow:
     1. If a single chunk directly answers -> pass through (no LLM call)
-    2. If multiple sources or conflicts -> LLM synthesis
-    3. If comparative query -> table format, higher token cap
-    4. Enforce token cap
+    2. Determine similarity tier for model selection
+    3. If multiple sources or conflicts -> LLM synthesis via 9-model router
+    4. If comparative query -> table format, higher token cap, stronger models
+    5. Enforce token cap
 
     Args:
         query: User query
@@ -293,29 +215,34 @@ async def synthesize(
                 token_count=_estimate_tokens(direct_answer),
                 sources_used=sources_used,
                 method="pass_through",
+                model_used="pass-through",
+                provider="none",
+                fallback_count=0,
             )
 
     # Step 2: Build context for LLM
     context = _build_context(chunks, scraped_text)
 
-    # Step 3: Determine token budget
+    # Step 3: Determine token budget and similarity for tier selection
     table_needed = _detect_table_needed(query, chunks)
     max_tokens = MAX_SYNTHESIS_TOKENS if table_needed else DEFAULT_SYNTHESIS_TOKENS
 
-    # Step 4: LLM synthesis
-    if ANTHROPIC_API_KEY:
-        answer = await synthesize_anthropic(query, context, max_tokens)
-    elif OPENAI_API_KEY:
-        answer = await synthesize_openai(query, context, max_tokens)
-    else:
-        # No LLM available — return raw context with citations
-        answer = context[:max_tokens * 4]  # Rough char limit
-        return SynthesisResult(
-            answer=answer,
-            token_count=_estimate_tokens(answer),
-            sources_used=sources_used,
-            method="raw_context",
-        )
+    # Calculate average similarity for model tier selection
+    avg_similarity = None
+    if chunks:
+        avg_similarity = sum(c.similarity_score for c in chunks) / len(chunks)
+
+    # Step 4: LLM synthesis via 9-model fallback router
+    router_result = await synthesize_with_router(
+        query=query,
+        context=context,
+        max_tokens=max_tokens,
+        similarity=avg_similarity,
+        table_needed=table_needed,
+        system_prompt=APEX_SYSTEM_PROMPT,
+    )
+
+    answer = router_result.content
 
     # Step 5: Enforce token cap (hard truncate if needed)
     token_count = _estimate_tokens(answer)
@@ -331,9 +258,17 @@ async def synthesize(
 
     method = "table" if table_needed else "synthesis"
 
+    # If all models failed, fall back to raw context
+    if answer.startswith("[ALL_LLM_FAILED]"):
+        answer = context[:max_tokens * 4]
+        method = "raw_context"
+
     return SynthesisResult(
         answer=answer,
         token_count=token_count,
         sources_used=sources_used,
         method=method,
+        model_used=router_result.model_name,
+        provider=router_result.provider,
+        fallback_count=router_result.fallback_count,
     )
