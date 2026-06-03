@@ -9,11 +9,11 @@ Core principles:
 5. No reasoning emitted: Internal chain-of-thought stays internal.
 6. If a tool result directly answers the query, emit it verbatim with ≤5 words of framing.
 
-Uses the 9-model fallback router:
+Uses the 9-model fallback router (all Cloudflare Workers AI):
 - similarity > 0.85 → Pass-through (no LLM call at all)
-- similarity 0.72-0.85 → Cloudflare cheap models (Granite, GLM-4.7)
-- similarity < 0.72 → Full fallback chain up to DeepSeek-V3
-- Table queries → Mid+ capable models only
+- similarity 0.72-0.85 → Cheap CF models (Granite → Llama-1B → GLM-4.7 → Llama-3B → Qwen3-30B)
+- similarity < 0.72 → Full 9-model chain up to Llama-3.3-70B
+- Table queries → Mid+ capable models (Qwen3-30B → Llama-8B → Mistral-24B → Llama-70B)
 """
 
 import json

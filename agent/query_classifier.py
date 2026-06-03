@@ -3,7 +3,7 @@ Query Classifier — routes queries to RAG or live scraper.
 
 Uses a three-stage approach:
 1. Rule-based fast path (zero LLM cost)
-2. LLM fallback via the 9-model router (Cloudflare → GitHub)
+2. LLM fallback via the 9-model router (all Cloudflare Workers AI)
 3. Similarity-based escalation after RAG retrieval
 
 Output: {"route": "rag" | "live", "reason": "...", "domain_hint": "..."}
@@ -117,8 +117,8 @@ async def classify_llm(query: str) -> ClassificationResult:
     """
     LLM-based query classification using the 9-model fallback router.
 
-    Tries cheapest models first (Cloudflare Granite → GLM-4.7-Flash),
-    falls back to GitHub Models if Cloudflare is unavailable.
+    Tries cheapest Cloudflare models first (Granite → Llama-1B → GLM-4.7-Flash),
+    falls back to stronger models if earlier ones are unavailable.
 
     Args:
         query: User query string

@@ -1,0 +1,237 @@
+# ═══════════════════════════════════════════════════════════════
+# APEX Research Agent — 9-Model Fallback Chain Configuration
+# ═══════════════════════════════════════════════════════════════
+#
+# Fallback order: cheapest → most capable
+# On failure (API error, timeout, rate limit, empty response),
+# the router automatically falls through to the next model.
+#
+# Provider endpoints:
+#   cloudflare: https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
+#   github:     https://models.inference.ai.azure.com
+#   openai:     https://api.openai.com/v1
+#   anthropic:  https://api.anthropic.com/v1
+#
+# Tier selection logic:
+#   similarity > 0.85     → pass-through only (Tier 1)
+#   similarity 0.72-0.85  → cheap models (Tier 2-3)
+#   similarity < 0.72     → full chain up to Tier 9
+#   classification tasks  → cheapest configured model
+#   table queries         → mid + capable models only
+# ═══════════════════════════════════════════════════════════════
+
+defaults:
+  default_synthesis_tokens: 150
+  max_synthesis_tokens: 300
+  request_timeout_seconds: 30
+  max_retries_per_model: 1
+  similarity_threshold: 0.72
+  pass_through_threshold: 0.85
+
+models:
+  # ── Tier 1: Pass-through (No LLM call) ──
+  - name: "pass-through"
+    provider: "passthrough"
+    model_id: "none"
+    context_window: 0
+    max_output_tokens: 150
+    price_input_per_m: 0.0
+    price_output_per_m: 0.0
+    supports_tools: false
+    tier: "free"
+    enabled: true
+    description: "Direct source quote when similarity > 0.85. Zero LLM cost."
+
+  # ── Tier 2: Cloudflare Granite 4.0 Micro (~3B) ──
+  - name: "Granite-4.0-Micro"
+    provider: "cloudflare"
+    model_id: "@cf/ibm-granite/granite-4.0-h-micro"
+    context_window: 131000
+    max_output_tokens: 150
+    price_input_per_m: 0.017
+    price_output_per_m: 0.112
+    supports_tools: true
+    tier: "cheap"
+    enabled: true
+    description: "Cheapest LLM tier. Good for classification and simple Q&A. ~$0.02 per 1M input tokens."
+
+  # ── Tier 3: Cloudflare Llama 3.2 1B ──
+  - name: "Llama-3.2-1B"
+    provider: "cloudflare"
+    model_id: "@cf/meta/llama-3.2-1b-instruct"
+    context_window: 131000
+    max_output_tokens: 150
+    price_input_per_m: 0.008
+    price_output_per_m: 0.032
+    supports_tools: false
+    tier: "cheap"
+    enabled: true
+    description: "Ultra-cheap fallback. 1B params, fastest inference on CF."
+
+  # ── Tier 4: Cloudflare GLM-4.7 Flash (~4.7B) ──
+  - name: "GLM-4.7-Flash"
+    provider: "cloudflare"
+    model_id: "@cf/zai-org/glm-4.7-flash"
+    context_window: 131072
+    max_output_tokens: 150
+    price_input_per_m: 0.060
+    price_output_per_m: 0.400
+    supports_tools: true
+    tier: "cheap"
+    enabled: true
+    description: "Strong multilingual model. Excellent for synthesis and citation tasks."
+
+  # ── Tier 5: Cloudflare Llama 3.2 3B ──
+  - name: "Llama-3.2-3B"
+    provider: "cloudflare"
+    model_id: "@cf/meta/llama-3.2-3b-instruct"
+    context_window: 131000
+    max_output_tokens: 200
+    price_input_per_m: 0.022
+    price_output_per_m: 0.089
+    supports_tools: false
+    tier: "cheap"
+    enabled: true
+    description: "Step up from 1B. Better instruction following for synthesis."
+
+  # ── Tier 6: Cloudflare Qwen3 30B MoE ──
+  - name: "Qwen3-30B-MoE"
+    provider: "cloudflare"
+    model_id: "@cf/qwen/qwen3-30b-a3b-fp8"
+    context_window: 32768
+    max_output_tokens: 200
+    price_input_per_m: 0.051
+    price_output_per_m: 0.335
+    supports_tools: true
+    tier: "mid"
+    enabled: true
+    description: "30B MoE with 3B active params. Great quality/cost ratio for table queries."
+
+  # ── Tier 7: Cloudflare Llama 3.1 8B FP8 ──
+  - name: "Llama-3.1-8B"
+    provider: "cloudflare"
+    model_id: "@cf/meta/llama-3.1-8b-instruct-fp8"
+    context_window: 131000
+    max_output_tokens: 300
+    price_input_per_m: 0.075
+    price_output_per_m: 0.300
+    supports_tools: true
+    tier: "mid"
+    enabled: true
+    description: "8B dense model. Reliable for complex synthesis and conflict resolution."
+
+  # ── Tier 8: Cloudflare Mistral Small 3.1 24B ──
+  - name: "Mistral-Small-3.1-24B"
+    provider: "cloudflare"
+    model_id: "@cf/mistralai/mistral-small-3.1-24b-instruct"
+    context_window: 128000
+    max_output_tokens: 300
+    price_input_per_m: 0.351
+    price_output_per_m: 0.555
+    supports_tools: true
+    tier: "mid"
+    enabled: true
+    description: "24B model with vision support. Best for complex multi-source synthesis."
+
+  # ── Tier 9: Cloudflare Llama 3.3 70B FP8 Fast ──
+  - name: "Llama-3.3-70B"
+    provider: "cloudflare"
+    model_id: "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    context_window: 131000
+    max_output_tokens: 300
+    price_input_per_m: 0.650
+    price_output_per_m: 1.300
+    supports_tools: true
+    tier: "capable"
+    enabled: true
+    description: "70B flagship. Final fallback for hardest queries. Highest quality on CF."
+
+  # ── Bonus: GitHub Models (free tier, 150 req/day) ──
+  # Uncomment to enable as additional fallbacks beyond Tier 9
+
+  # - name: "Phi-4-Mini"
+  #   provider: "github"
+  #   model_id: "Phi-4-mini-instruct"
+  #   context_window: 128000
+  #   max_output_tokens: 150
+  #   price_input_per_m: 0.0
+  #   price_output_per_m: 0.0
+  #   supports_tools: false
+  #   tier: "free"
+  #   enabled: true
+  #   description: "Free GitHub Models tier. 3.8B params, 150 req/day."
+
+  # - name: "Mistral-Nemo-12B"
+  #   provider: "github"
+  #   model_id: "Mistral-Nemo"
+  #   context_window: 128000
+  #   max_output_tokens: 300
+  #   price_input_per_m: 0.0
+  #   price_output_per_m: 0.0
+  #   supports_tools: true
+  #   tier: "free"
+  #   enabled: true
+  #   description: "Free GitHub Models tier. 12B params, 150 req/day."
+
+  # - name: "GPT-4o-Mini"
+  #   provider: "github"
+  #   model_id: "gpt-4o-mini"
+  #   context_window: 128000
+  #   max_output_tokens: 300
+  #   price_input_per_m: 0.0
+  #   price_output_per_m: 0.0
+  #   supports_tools: true
+  #   tier: "cloud"
+  #   enabled: true
+  #   description: "Free GitHub Models tier. GPT-4o-mini, 150 req/day."
+
+  # - name: "DeepSeek-V3"
+  #   provider: "github"
+  #   model_id: "DeepSeek-V3-0324"
+  #   context_window: 128000
+  #   max_output_tokens: 300
+  #   price_input_per_m: 0.0
+  #   price_output_per_m: 0.0
+  #   supports_tools: false
+  #   tier: "capable"
+  #   enabled: true
+  #   description: "Free GitHub Models tier. 671B MoE, 150 req/day. Final ultimate fallback."
+
+tier_selection:
+  # Similarity-based routing
+  high_confidence:
+    threshold: 0.85
+    models: ["pass-through"]
+    description: "Direct quote from source. Zero LLM cost."
+
+  medium_confidence:
+    threshold_min: 0.72
+    threshold_max: 0.85
+    models: ["Granite-4.0-Micro", "Llama-3.2-1B", "GLM-4.7-Flash", "Llama-3.2-3B", "Qwen3-30B-MoE"]
+    description: "Cheap Cloudflare models for medium-difficulty synthesis."
+
+  low_confidence:
+    threshold_max: 0.72
+    models: "all"  # Use entire fallback chain
+    description: "Full 9-model chain including 70B for hardest queries."
+
+  # Task-based routing
+  classification:
+    models: ["Granite-4.0-Micro", "Llama-3.2-1B", "GLM-4.7-Flash"]
+    description: "Cheapest models for query classification (3-model subset)."
+
+  table_queries:
+    models: ["Qwen3-30B-MoE", "Llama-3.1-8B", "Mistral-Small-3.1-24B", "Llama-3.3-70B"]
+    description: "Mid+ capable models for table format generation."
+
+cost_estimate:
+  # Based on 30,000 queries/month
+  # ~60% pass-through, ~25% cheap models, ~10% mid, ~5% capable
+  queries_per_month: 30000
+  distribution:
+    pass_through: 0.60    # 18,000 queries - $0
+    cheap_models: 0.25    # 7,500 queries  - ~$0.50
+    mid_models: 0.10      # 3,000 queries  - ~$1.50
+    capable_models: 0.05  # 1,500 queries  - ~$2.00
+  estimated_monthly_cost_usd: 4.00
+  notes: "Conservative estimate. Actual cost likely lower due to pass-through optimization."

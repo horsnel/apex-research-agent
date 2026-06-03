@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from agent.query_classifier import classify_query, ClassificationResult, should_escalate_to_live
 from agent.retriever import retrieve, RetrievedChunk
 from agent.synthesizer import synthesize, SynthesisResult
-from agent.llm_router import get_router_status, FALLBACK_CHAIN
+from agent.llm_router import get_router_status, test_all_models, reload_config, FALLBACK_CHAIN
 from tools.live_scraper import live_scrape, ScrapeResult
 from tools.citation_validator import validate_citations, ValidationResult
 from ingest.chunker import chunk_text
@@ -533,17 +533,59 @@ async def router_chain():
                 "price_output_per_m": m.price_output_per_m,
                 "context_window": m.context_window,
                 "supports_tools": m.supports_tools,
+                "description": m.description,
             }
             for i, m in enumerate(FALLBACK_CHAIN)
         ],
         "tier_selection": {
             "similarity_gt_0.85": "pass-through (no LLM)",
-            "similarity_0.72_0.85": "Granite-4.0 → GLM-4.7 → Qwen3-30B → Mistral-24B",
-            "similarity_lt_0.72": "Full 9-model chain up to DeepSeek-V3",
-            "table_queries": "Mid + capable models only",
-            "classification": "Cheapest configured model",
+            "similarity_0.72_0.85": "Granite-4.0 → Llama-1B → GLM-4.7 → Llama-3B → Qwen3-30B",
+            "similarity_lt_0.72": "Full 9-model chain up to Llama-3.3-70B",
+            "table_queries": "Qwen3-30B → Llama-8B → Mistral-24B → Llama-70B",
+            "classification": "Cheapest configured model (Granite/Llama-1B)",
         },
     }
+
+
+@app.post("/router/test")
+async def router_test():
+    """
+    Test connectivity for all 9 models in the fallback chain.
+
+    Sends a simple prompt to each configured model and reports:
+    - Whether it responded
+    - Latency in ms
+    - Any errors
+    - Sample output
+
+    Use this to verify your Cloudflare API token has Workers AI permission.
+    """
+    results = await test_all_models()
+    return {
+        "total_models": len(results),
+        "configured": sum(1 for r in results if r.configured),
+        "reachable": sum(1 for r in results if r.reachable),
+        "results": [
+            {
+                "name": r.model_name,
+                "model_id": r.model_id,
+                "provider": r.provider,
+                "configured": r.configured,
+                "reachable": r.reachable,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+                "sample_output": r.sample_output,
+            }
+            for r in results
+        ],
+    }
+
+
+@app.post("/router/reload")
+async def router_reload():
+    """Reload model configuration from config/llm_models.yaml."""
+    reload_config()
+    return {"status": "success", "models_loaded": len(FALLBACK_CHAIN)}
 
 
 # ── MCP Mount ──
