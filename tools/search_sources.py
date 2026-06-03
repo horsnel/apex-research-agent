@@ -59,6 +59,7 @@ REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
 WOLFRAM_APP_ID = os.getenv("WOLFRAM_APP_ID", "")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 PODCAST_INDEX_API_KEY = os.getenv("PODCAST_INDEX_API_KEY", "")
+PODCAST_INDEX_API_SECRET = os.getenv("PODCAST_INDEX_API_SECRET", "")
 MASTODON_INSTANCE = os.getenv("MASTODON_INSTANCE", "mastodon.social")
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "apex-research@example.com")
 
@@ -1914,77 +1915,78 @@ async def search_podcast_index(
     Best for: Finding expert audio content, tech podcasts, 
     interview discussions, educational audio content.
     """
-    if not PODCAST_INDEX_API_KEY:
-        # Fallback: Serper with podcast search
-        if SERPER_API_KEY:
-            try:
-                async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-                    r = await client.post(
-                        "https://google.serper.dev/search",
-                        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
-                        json={"q": f"podcast {query}", "num": max_results},
-                    )
-                    r.raise_for_status()
-                    data = r.json()
-                results = []
-                for item in data.get("organic", []):
-                    results.append(SearchResult(
-                        title=item.get("title", ""),
-                        url=item.get("link", ""),
-                        snippet=item.get("snippet", ""),
-                        source_name="podcast_via_serper",
-                        source_category=SourceCategory.AUDIO,
-                        source_tier="P3",
-                    ))
-                return results
-            except Exception:
-                pass
-        return []
+    if PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET:
+        try:
+            import hashlib
+            # Podcast Index API auth: sha1(apiKey + apiSecret + timestamp)
+            api_key = PODCAST_INDEX_API_KEY
+            api_secret = PODCAST_INDEX_API_SECRET
+            timestamp = str(int(time.time()))
+            hash_input = api_key + api_secret + timestamp
+            auth_hash = hashlib.sha1(hash_input.encode()).hexdigest()
+            
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.get(
+                    "https://api.podcastindex.org/api/1.0/search/byterm",
+                    headers={
+                        "X-Auth-Key": api_key,
+                        "X-Auth-Date": timestamp,
+                        "Authorization": auth_hash,
+                        "User-Agent": "ApexResearchAgent/2.0 (https://github.com/horsnel/apex-research-agent)",
+                    },
+                    params={"q": query, "max": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            
+            results = []
+            for feed in data.get("feeds", []):
+                results.append(SearchResult(
+                    title=feed.get("title", ""),
+                    url=feed.get("link", "") or feed.get("url", ""),
+                    snippet=feed.get("description", "")[:300] if feed.get("description") else "",
+                    source_name="podcast_index",
+                    source_category=SourceCategory.AUDIO,
+                    source_tier="P3",
+                    extra={
+                        "episode_count": feed.get("episodeCount", 0),
+                        "feed_url": feed.get("url", ""),
+                        "categories": feed.get("categories", {}),
+                    },
+                ))
+            
+            return results
+        
+        except Exception as e:
+            logger.warning(f"Podcast Index API failed: {e}")
+            # Fall through to Serper fallback
     
-    try:
-        import hashlib
-        # Podcast Index API requires auth headers
-        api_key = PODCAST_INDEX_API_KEY
-        api_header = "APEX Research Agent"
-        timestamp = str(int(time.time()))
-        hash_input = api_key + api_header + timestamp
-        auth_hash = hashlib.sha1(hash_input.encode()).hexdigest()
-        
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-            r = await client.get(
-                "https://api.podcastindex.org/api/1.0/search/byterm",
-                headers={
-                    "X-Auth-Key": api_key,
-                    "X-Auth-Date": timestamp,
-                    "Authorization": auth_hash,
-                    "User-Agent": "APEX-Research-Agent/1.0",
-                },
-                params={"q": query, "max": max_results},
-            )
-            r.raise_for_status()
-            data = r.json()
-        
-        results = []
-        for feed in data.get("feeds", []):
-            results.append(SearchResult(
-                title=feed.get("title", ""),
-                url=feed.get("link", "") or feed.get("url", ""),
-                snippet=feed.get("description", "")[:300] if feed.get("description") else "",
-                source_name="podcast_index",
-                source_category=SourceCategory.AUDIO,
-                source_tier="P3",
-                extra={
-                    "episode_count": feed.get("episodeCount", 0),
-                    "feed_url": feed.get("url", ""),
-                    "categories": feed.get("categories", {}),
-                },
-            ))
-        
-        return results
+    # Fallback: Serper with podcast search
+    if SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": f"podcast {query}", "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            results = []
+            for item in data.get("organic", []):
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source_name="podcast_via_serper",
+                    source_category=SourceCategory.AUDIO,
+                    source_tier="P3",
+                ))
+            return results
+        except Exception as e:
+            logger.debug(f"Podcast Index via Serper fallback failed: {e}")
     
-    except Exception as e:
-        logger.warning(f"Podcast Index search failed: {e}")
-        return []
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2493,11 +2495,11 @@ def get_source_status() -> Dict[str, Any]:
         "google_scholar": {"key_needed": True, "status": "Via Serper | 389M+ articles", "key_configured": bool(SERPER_API_KEY), "category": "academic"},
         "google_patents": {"key_needed": True, "status": "Via Serper | 120M+ patents", "key_configured": bool(SERPER_API_KEY), "category": "patents"},
         "substack": {"key_needed": True, "status": "Via Serper | Newsletter search", "key_configured": bool(SERPER_API_KEY), "category": "news"},
-        "youtube": {"key_needed": True, "status": "Via Serper fallback | Or YouTube API key", "key_configured": bool(YOUTUBE_API_KEY), "category": "video"},
+        "youtube": {"key_needed": "optional", "status": "YouTube API key (10K units/day) or Serper fallback", "key_configured": bool(YOUTUBE_API_KEY), "category": "video"},
         "brave": {"key_needed": True, "status": "Free: 2K req/mo", "key_configured": bool(BRAVE_SEARCH_API_KEY), "category": "web"},
         "tavily": {"key_needed": True, "status": "Free: 1K req/mo | AI-optimized", "key_configured": bool(TAVILY_API_KEY), "category": "web"},
-        "newsapi": {"key_needed": True, "status": "Free: 100 req/day", "key_configured": bool(NEWSAPI_KEY), "category": "news"},
+        "newsapi": {"key_needed": "optional", "status": "Free: 100 req/day | 150K+ sources", "key_configured": bool(NEWSAPI_KEY), "category": "news"},
         "wolfram": {"key_needed": True, "status": "Free: 2K req/mo | Computation", "key_configured": bool(WOLFRAM_APP_ID), "category": "computation"},
-        "podcast_index": {"key_needed": True, "status": "Free | Podcast search", "key_configured": bool(PODCAST_INDEX_API_KEY), "category": "audio"},
+        "podcast_index": {"key_needed": "optional", "status": "Free API (key+secret) | 4M+ podcasts | Serper fallback", "key_configured": bool(PODCAST_INDEX_API_KEY and PODCAST_INDEX_API_SECRET), "category": "audio"},
     }
     return sources
