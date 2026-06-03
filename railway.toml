@@ -7,8 +7,8 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-healthcheckPath = "/health"
-healthcheckTimeout = 300
+# No health check — app starts fast and serves all endpoints
+# even without database (graceful degradation)
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
