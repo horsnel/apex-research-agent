@@ -45,8 +45,46 @@ logger = logging.getLogger("apex")
 # ── Lifespan ──
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup/shutdown lifecycle."""
+    """Startup/shutdown lifecycle — auto-initializes database on first run."""
     logger.info("APEX Research Agent starting up...")
+    
+    # Auto-initialize database if DATABASE_URL is set
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url:
+        try:
+            from db.init_railway import init_database
+            success = await asyncio.wait_for(init_database(), timeout=30.0)
+            if success:
+                # Update DATABASE_URL to point to apex_db instead of postgres default
+                from urllib.parse import urlparse, urlunparse
+                parsed = urlparse(db_url)
+                if parsed.path.lstrip("/") != "apex_db":
+                    new_url = urlunparse(parsed._replace(path="/apex_db"))
+                    os.environ["DATABASE_URL"] = new_url
+                    logger.info(f"Switched DATABASE_URL to apex_db")
+                    
+                    # Also update the DATABASE_URL in the retriever module
+                    from agent import retriever
+                    retriever.DATABASE_URL = new_url
+                    
+                    # Update in other modules that import it
+                    try:
+                        from ingest import embedder
+                        if hasattr(embedder, 'DATABASE_URL'):
+                            embedder.DATABASE_URL = new_url
+                    except Exception:
+                        pass
+                    
+                logger.info("Database initialized successfully")
+            else:
+                logger.warning("Database initialization failed — running in DB-less mode")
+        except asyncio.TimeoutError:
+            logger.warning("Database initialization timed out — running in DB-less mode")
+        except Exception as e:
+            logger.warning(f"Database initialization error: {e} — running in DB-less mode")
+    else:
+        logger.info("No DATABASE_URL set — running in live-only mode")
+    
     yield
     logger.info("APEX Research Agent shutting down.")
 
