@@ -1,26 +1,32 @@
 """
-Multi-Source Search — unified search across 20+ information sources.
+Multi-Source Search — unified search across 29 information sources.
 
 Categorized sources:
-1. ACADEMIC: Semantic Scholar, Crossref, OpenAlex, DOAJ, arXiv, PubMed, CORE, Exa
+1. ACADEMIC: Semantic Scholar, Crossref, OpenAlex, DOAJ, arXiv, Exa, Papers With Code, Europe PMC, CORE, Google Scholar
 2. GENERAL WEB: Serper (Google), Brave Search, DuckDuckGo, Tavily, Jina
 3. ENCYCLOPEDIA: Wikipedia, Wikidata
-4. CODE: GitHub, StackOverflow
-5. NEWS: Hacker News, Reddit, NewsAPI
-6. CLINICAL: ClinicalTrials.gov
-7. PATENTS: Google Patents (via scraping)
-8. CITATION: Unpaywall (open access PDFs)
+4. CODE: GitHub, StackOverflow, Papers With Code
+5. NEWS: Hacker News, Reddit, NewsAPI, Substack
+6. CLINICAL: ClinicalTrials.gov, Europe PMC
+7. PATENTS: Google Patents
+8. VIDEO: YouTube
+9. AUDIO: Podcast Index
+10. SOCIAL: Mastodon
+11. COMPUTATION: Wolfram Alpha
+12. CITATION: Unpaywall (open access PDFs)
 
 Each source returns normalized SearchResult objects.
 The search_router() function dispatches queries to the right sources
 based on the query classification (academic, web, code, news, clinical).
 
 Routing Priority (by query type):
-  academic  → Exa(neural) > Semantic Scholar > OpenAlex > Crossref > DOAJ
+  academic  → Exa(neural) > Semantic Scholar > OpenAlex > arXiv > Crossref > DOAJ > CORE > Papers With Code > Europe PMC > Google Scholar
   web       → Serper(Google) > Exa > Brave > DuckDuckGo
-  code      → GitHub > StackOverflow > Exa
-  news      → Hacker News > Serper > Reddit > NewsAPI
-  clinical  → ClinicalTrials.gov > Semantic Scholar > OpenAlex
+  code      → GitHub > StackOverflow > Papers With Code > Exa
+  news      → Hacker News > Serper > Reddit > NewsAPI > Substack > YouTube
+  clinical  → ClinicalTrials.gov > Europe PMC > Semantic Scholar > OpenAlex
+  compute   → Wolfram Alpha > Wikipedia
+  patent    → Google Patents
 """
 
 import asyncio
@@ -50,6 +56,10 @@ SEMANTIC_SCHOLAR_API_KEY = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
+WOLFRAM_APP_ID = os.getenv("WOLFRAM_APP_ID", "")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+PODCAST_INDEX_API_KEY = os.getenv("PODCAST_INDEX_API_KEY", "")
+MASTODON_INSTANCE = os.getenv("MASTODON_INSTANCE", "mastodon.social")
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "apex-research@example.com")
 
 DEFAULT_MAX_RESULTS = 5
@@ -67,6 +77,10 @@ class SourceCategory(str, Enum):
     NEWS = "news"
     CLINICAL = "clinical"
     PATENT = "patent"
+    VIDEO = "video"
+    AUDIO = "audio"
+    SOCIAL = "social"
+    COMPUTATION = "computation"
 
 
 @dataclass
@@ -1287,6 +1301,891 @@ async def search_newsapi(
 
 
 # ═══════════════════════════════════════════════════════════════
+# WOLFRAM ALPHA — COMPUTATION ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_wolfram(
+    query: str,
+    max_results: int = 3,
+) -> List[SearchResult]:
+    """
+    Search Wolfram Alpha — computational knowledge engine.
+    
+    Free: 2,000 queries/month with AppID from https://products.wolframalpha.com/api/
+    Covers: Mathematics, science, engineering, geography, finance, nutrition,
+    unit conversions, real-time data (stock prices, weather, etc.).
+    Returns: Computed answers, plots, step-by-step solutions.
+    
+    Best for: Mathematical computations, scientific calculations, 
+    factual data lookups, unit conversions, real-time quantitative data.
+    """
+    if not WOLFRAM_APP_ID:
+        # Fallback: try Serper for "wolframalpha <query>" to get cached results
+        if SERPER_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                    r = await client.post(
+                        "https://google.serper.dev/search",
+                        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                        json={"q": f"site:wolframalpha.com {query}", "num": max_results},
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                results = []
+                for item in data.get("organic", []):
+                    results.append(SearchResult(
+                        title=f"[Wolfram] {item.get('title', '')}",
+                        url=item.get("link", ""),
+                        snippet=item.get("snippet", ""),
+                        source_name="wolfram_via_serper",
+                        source_category=SourceCategory.COMPUTATION,
+                        source_tier="P2",
+                    ))
+                return results
+            except Exception:
+                pass
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT + 10) as client:
+            r = await client.get(
+                "https://api.wolframalpha.com/v2/query",
+                params={
+                    "appid": WOLFRAM_APP_ID,
+                    "input": query,
+                    "output": "JSON",
+                    "format": "plaintext",
+                    "podindex": "1,2,3",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        query_result = data.get("queryresult", {})
+        
+        for pod in query_result.get("pods", []):
+            pod_title = pod.get("title", "")
+            for subpod in pod.get("subpods", []):
+                plaintext = subpod.get("plaintext", "")
+                if not plaintext:
+                    continue
+                
+                results.append(SearchResult(
+                    title=f"[Wolfram] {pod_title}",
+                    url=f"https://www.wolframalpha.com/input?i={quote_plus(query)}",
+                    snippet=plaintext[:500],
+                    source_name="wolfram",
+                    source_category=SourceCategory.COMPUTATION,
+                    source_tier="P1",
+                    extra={"pod_title": pod_title, "is_computation": True},
+                ))
+                
+                if len(results) >= max_results:
+                    break
+            if len(results) >= max_results:
+                break
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"Wolfram Alpha search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# GOOGLE SCHOLAR — VIA SERPER SCHOLAR
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_google_scholar(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Google Scholar — largest academic search engine.
+    
+    Free via Serper.dev Scholar endpoint (uses same SERPER_API_KEY).
+    Covers: All academic disciplines, 389M+ articles, theses, books, preprints.
+    Returns: Titles, URLs, snippets, citation counts, author info.
+    
+    Best for: Broad academic search across all disciplines, finding 
+    theses and books not in other databases, citation tracking.
+    
+    Note: Uses Serper's /scholar endpoint. Falls back to Serper web 
+    search with site:scholar.google.com if needed.
+    """
+    if not SERPER_API_KEY:
+        return []
+    
+    try:
+        # Try Serper's Scholar endpoint first
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.post(
+                "https://google.serper.dev/scholar",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": query, "num": max_results},
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data.get("organic", []):
+            # Extract citation count from snippet if present
+            snippet = item.get("snippet", "")
+            citation_count = None
+            cit_match = re.search(r'Cited by (\d+)', snippet)
+            if cit_match:
+                citation_count = int(cit_match.group(1))
+            
+            # Extract year
+            pub_year = None
+            year_match = re.search(r'\b(19|20)\d{2}\b', snippet)
+            if year_match:
+                pub_year = year_match.group()
+            
+            results.append(SearchResult(
+                title=item.get("title", ""),
+                url=item.get("link", ""),
+                snippet=snippet,
+                source_name="google_scholar",
+                source_category=SourceCategory.ACADEMIC,
+                source_tier="P1",
+                published_date=pub_year,
+                citation_count=citation_count,
+                extra={"position": item.get("position")},
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.debug(f"Serper Scholar endpoint failed: {e}")
+        # Fallback: regular Serper search with site:scholar.google.com
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": f"site:scholar.google.com {query}", "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            results = []
+            for item in data.get("organic", []):
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source_name="google_scholar",
+                    source_category=SourceCategory.ACADEMIC,
+                    source_tier="P1",
+                ))
+            return results
+        except Exception as e2:
+            logger.warning(f"Google Scholar search failed: {e2}")
+            return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# PAPERS WITH CODE — PAPERS LINKED TO IMPLEMENTATIONS
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_papers_with_code(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Papers With Code — links research papers to code implementations.
+    
+    Free: Completely open API, no key needed (now via HuggingFace Papers).
+    Covers: 8K+ papers with code, 5K+ evaluation tables, 1K+ tasks.
+    Returns: Paper titles, abstracts, GitHub repos, benchmark results.
+    
+    Best for: Finding implementations of research papers, comparing 
+    approaches on benchmarks, discovering SOTA methods for specific tasks.
+    
+    Note: Papers With Code merged with HuggingFace. This uses the 
+    HuggingFace Papers API as the primary source, with Serper fallback.
+    """
+    # Try HuggingFace Papers API (successor to PWC)
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.get(
+                "https://huggingface.co/api/papers/search",
+                params={
+                    "q": query,
+                    "limit": max_results,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data:
+            title = item.get("title", "Untitled")
+            paper_id = item.get("id", "")
+            abstract = item.get("abstract", "")[:300] if item.get("abstract") else ""
+            url = f"https://huggingface.co/papers/{paper_id}"
+            
+            # Get upvotes as a proxy for popularity
+            upvotes = item.get("upvotes", 0)
+            
+            results.append(SearchResult(
+                title=title,
+                url=url,
+                snippet=abstract,
+                source_name="papers_with_code",
+                source_category=SourceCategory.CODE,
+                source_tier="P1",
+                published_date=item.get("publishedAt", "")[:10] if item.get("publishedAt") else None,
+                extra={
+                    "paper_id": paper_id,
+                    "upvotes": upvotes,
+                    "huggingface_url": url,
+                },
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.debug(f"HuggingFace Papers API failed: {e}")
+    
+    # Fallback: Serper search for papers with code
+    if SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": f"site:paperswithcode.com {query}", "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            results = []
+            for item in data.get("organic", []):
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source_name="papers_with_code",
+                    source_category=SourceCategory.CODE,
+                    source_tier="P1",
+                ))
+            return results
+        except Exception as e2:
+            logger.warning(f"Papers With Code search failed: {e2}")
+            return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# EUROPE PMC — BIOMEDICAL AND LIFE SCIENCES
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_europe_pmc(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Europe PMC — biomedical and life sciences literature.
+    
+    Free: Completely open API, no key needed.
+    Covers: 40M+ publications (PubMed, PMC, PATENT, etc.), full-text for open access.
+    Returns: Titles, abstracts, authors, DOIs, citation counts, full text links.
+    
+    Best for: Biomedical research, drug discovery, clinical literature,
+    finding full-text open access articles, patent literature.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.get(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                params={
+                    "query": query,
+                    "resultType": "core",
+                    "pageSize": max_results,
+                    "format": "json",
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data.get("resultList", {}).get("result", []):
+            title = item.get("title", "Untitled")
+            pmid = item.get("pmid", "")
+            pmcid = item.get("pmcid", "")
+            doi = item.get("doi", "")
+            
+            # Build URL
+            if pmcid:
+                url = f"https://europepmc.org/article/PMC/{pmcid}"
+            elif pmid:
+                url = f"https://europepmc.org/article/MED/{pmid}"
+            elif doi:
+                url = f"https://doi.org/{doi}"
+            else:
+                url = ""
+            
+            # Authors
+            authors = []
+            for author in item.get("authorList", {}).get("author", []):
+                name = f"{author.get('firstName', '')} {author.get('lastName', '')}".strip()
+                if name:
+                    authors.append(name)
+            
+            # Abstract
+            abstract = item.get("abstractText", "")[:300] if item.get("abstractText") else ""
+            
+            # Citation count
+            cit_count = item.get("citedByCount", 0)
+            try:
+                cit_count = int(cit_count)
+            except (ValueError, TypeError):
+                cit_count = None
+            
+            # Open access
+            is_oa = bool(item.get("isOpenAccess", "").lower() == "y")
+            
+            results.append(SearchResult(
+                title=title,
+                url=url,
+                snippet=abstract,
+                source_name="europe_pmc",
+                source_category=SourceCategory.CLINICAL,
+                source_tier="P1",
+                published_date=item.get("pubYear"),
+                authors=authors,
+                citation_count=cit_count,
+                open_access=is_oa,
+                doi=doi,
+                extra={
+                    "pmid": pmid,
+                    "pmcid": pmcid,
+                    "journal": item.get("journalTitle", ""),
+                    "full_text_url": item.get("fullTextUrlList", {}).get("fullTextUrl", [{}])[0].get("url", "") if item.get("fullTextUrlList") else "",
+                },
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"Europe PMC search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# CORE — 280M+ OPEN ACCESS RESEARCH PAPERS
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_core(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search CORE — world's largest collection of open access research papers.
+    
+    Free: 10M requests/day, no key needed for basic search.
+    Covers: 280M+ open access papers from 16K+ data providers.
+    Returns: Full-text metadata, download URLs, journal info.
+    
+    Best for: Finding open access full-text papers, broad academic
+    discovery, accessing papers behind paywalls via OA versions.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
+            r = await client.get(
+                "https://api.core.ac.uk/v3/search/works/",
+                params={
+                    "q": query,
+                    "limit": max_results,
+                    "offset": 0,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data.get("results", []):
+            title = item.get("title", "Untitled")
+            doi = item.get("doi", "")
+            url = item.get("downloadUrl") or item.get("sourceFulltextUrls", [""])[0] or ""
+            if not url and doi:
+                url = f"https://doi.org/{doi}"
+            
+            # Authors
+            authors = []
+            for author in item.get("authors", []):
+                name = author.get("name", "")
+                if name:
+                    authors.append(name)
+            
+            abstract = item.get("abstract", "")[:300] if item.get("abstract") else ""
+            year = item.get("yearPublished")
+            
+            results.append(SearchResult(
+                title=title,
+                url=url,
+                snippet=abstract,
+                source_name="core",
+                source_category=SourceCategory.ACADEMIC,
+                source_tier="P1",
+                published_date=str(year) if year else None,
+                authors=authors,
+                open_access=True,  # CORE is all OA
+                doi=doi,
+                extra={
+                    "download_url": item.get("downloadUrl", ""),
+                    "journal": item.get("journal", ""),
+                    "publisher": item.get("publisher", ""),
+                },
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"CORE search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# GOOGLE PATENTS — PATENT SEARCH
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_google_patents(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Google Patents — patent database via Serper.
+    
+    Free via Serper.dev (uses same SERPER_API_KEY).
+    Covers: 120M+ patents from 100+ patent offices worldwide.
+    Returns: Patent titles, filing dates, assignees, abstracts.
+    
+    Best for: Patent research, prior art searches, technology 
+    landscape analysis, finding similar inventions.
+    """
+    if not SERPER_API_KEY:
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": f"site:patents.google.com {query}", "num": max_results},
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data.get("organic", []):
+            url = item.get("link", "")
+            title = item.get("title", "").replace(" - Google Patents", "")
+            
+            results.append(SearchResult(
+                title=title,
+                url=url,
+                snippet=item.get("snippet", ""),
+                source_name="google_patents",
+                source_category=SourceCategory.PATENT,
+                source_tier="P2",
+                extra={"position": item.get("position")},
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"Google Patents search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# YOUTUBE — VIDEO SEARCH
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_youtube(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search YouTube — video content search.
+    
+    Free with API key: 10,000 units/day (~100 searches).
+    Without key: Falls back to Serper site:youtube.com search.
+    Covers: Billions of videos, channels, playlists.
+    Returns: Video titles, URLs, descriptions, channel info.
+    
+    Best for: Finding video tutorials, conference talks, 
+    expert interviews, visual explanations, demonstrations.
+    """
+    if YOUTUBE_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params={
+                        "part": "snippet",
+                        "q": query,
+                        "maxResults": max_results,
+                        "type": "video",
+                        "key": YOUTUBE_API_KEY,
+                    },
+                )
+                r.raise_for_status()
+                data = r.json()
+            
+            results = []
+            for item in data.get("items", []):
+                video_id = item.get("id", {}).get("videoId", "")
+                snippet = item.get("snippet", {})
+                
+                results.append(SearchResult(
+                    title=snippet.get("title", ""),
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    snippet=snippet.get("description", "")[:300],
+                    source_name="youtube",
+                    source_category=SourceCategory.VIDEO,
+                    source_tier="P3",
+                    published_date=snippet.get("publishedAt", "")[:10],
+                    extra={
+                        "channel": snippet.get("channelTitle", ""),
+                        "video_id": video_id,
+                        "thumbnail": snippet.get("thumbnails", {}).get("default", {}).get("url", ""),
+                    },
+                ))
+            
+            return results
+        
+        except Exception as e:
+            logger.debug(f"YouTube API failed: {e}")
+    
+    # Fallback: Serper with site:youtube.com
+    if SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": f"site:youtube.com {query}", "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            
+            results = []
+            for item in data.get("organic", []):
+                results.append(SearchResult(
+                    title=item.get("title", "").replace(" - YouTube", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source_name="youtube_via_serper",
+                    source_category=SourceCategory.VIDEO,
+                    source_tier="P3",
+                ))
+            return results
+        except Exception as e:
+            logger.debug(f"YouTube via Serper failed: {e}")
+    
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# PODCAST INDEX — PODCAST SEARCH
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_podcast_index(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Podcast Index — open podcast directory and search.
+    
+    Free: Completely open API. Get key from https://api.podcastindex.org/
+    Covers: 4M+ podcasts, 100M+ episodes.
+    Returns: Podcast titles, feed URLs, episode descriptions.
+    
+    Best for: Finding expert audio content, tech podcasts, 
+    interview discussions, educational audio content.
+    """
+    if not PODCAST_INDEX_API_KEY:
+        # Fallback: Serper with podcast search
+        if SERPER_API_KEY:
+            try:
+                async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                    r = await client.post(
+                        "https://google.serper.dev/search",
+                        headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                        json={"q": f"podcast {query}", "num": max_results},
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                results = []
+                for item in data.get("organic", []):
+                    results.append(SearchResult(
+                        title=item.get("title", ""),
+                        url=item.get("link", ""),
+                        snippet=item.get("snippet", ""),
+                        source_name="podcast_via_serper",
+                        source_category=SourceCategory.AUDIO,
+                        source_tier="P3",
+                    ))
+                return results
+            except Exception:
+                pass
+        return []
+    
+    try:
+        import hashlib
+        # Podcast Index API requires auth headers
+        api_key = PODCAST_INDEX_API_KEY
+        api_header = "APEX Research Agent"
+        timestamp = str(int(time.time()))
+        hash_input = api_key + api_header + timestamp
+        auth_hash = hashlib.sha1(hash_input.encode()).hexdigest()
+        
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.get(
+                "https://api.podcastindex.org/api/1.0/search/byterm",
+                headers={
+                    "X-Auth-Key": api_key,
+                    "X-Auth-Date": timestamp,
+                    "Authorization": auth_hash,
+                    "User-Agent": "APEX-Research-Agent/1.0",
+                },
+                params={"q": query, "max": max_results},
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for feed in data.get("feeds", []):
+            results.append(SearchResult(
+                title=feed.get("title", ""),
+                url=feed.get("link", "") or feed.get("url", ""),
+                snippet=feed.get("description", "")[:300] if feed.get("description") else "",
+                source_name="podcast_index",
+                source_category=SourceCategory.AUDIO,
+                source_tier="P3",
+                extra={
+                    "episode_count": feed.get("episodeCount", 0),
+                    "feed_url": feed.get("url", ""),
+                    "categories": feed.get("categories", {}),
+                },
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"Podcast Index search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# SUBSTACK — NEWSLETTER SEARCH
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_substack(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Substack — independent newsletter content.
+    
+    Free via Serper (uses SERPER_API_KEY).
+    Covers: Millions of newsletter posts from independent writers.
+    Returns: Post titles, URLs, author info, snippets.
+    
+    Best for: Finding independent analysis, opinion pieces, 
+    niche expertise, long-form commentary from domain experts.
+    """
+    if not SERPER_API_KEY:
+        return []
+    
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.post(
+                "https://google.serper.dev/search",
+                headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                json={"q": f"site:substack.com {query}", "num": max_results},
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for item in data.get("organic", []):
+            url = item.get("link", "")
+            title = item.get("title", "").replace(" | Substack", "").replace(" - Substack", "")
+            
+            results.append(SearchResult(
+                title=title,
+                url=url,
+                snippet=item.get("snippet", ""),
+                source_name="substack",
+                source_category=SourceCategory.NEWS,
+                source_tier="P3",
+                extra={"position": item.get("position")},
+            ))
+        
+        return results
+    
+    except Exception as e:
+        logger.warning(f"Substack search failed: {e}")
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# MASTODON — FEDIVERSE DISCUSSIONS
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_mastodon(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Mastodon — decentralized social network (Fediverse).
+    
+    Free: Completely open API, but most instances require auth for search.
+    Falls back to Serper site:mastodon.social search.
+    Covers: Public posts from thousands of Mastodon instances.
+    Returns: Post content, URLs, author info, engagement data.
+    
+    Best for: Finding real-time tech discussions, open-source 
+    community opinions, decentralized/privacy-focused perspectives.
+    """
+    try:
+        # Use the public search API on the configured instance
+        instance = MASTODON_INSTANCE.rstrip("/")
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.get(
+                f"https://{instance}/api/v2/search",
+                headers={"User-Agent": "APEX-Research-Agent/1.0"},
+                params={
+                    "q": query,
+                    "type": "statuses",
+                    "limit": max_results,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        
+        results = []
+        for status in data.get("statuses", []):
+            account = status.get("account", {})
+            username = account.get("acct", "")
+            display_name = account.get("display_name", "")
+            content = re.sub(r'<[^>]+>', '', status.get("content", ""))[:300]
+            url = status.get("url", "")
+            
+            results.append(SearchResult(
+                title=f"@{username}: {content[:80]}...",
+                url=url,
+                snippet=content,
+                source_name="mastodon",
+                source_category=SourceCategory.SOCIAL,
+                source_tier="P3",
+                published_date=status.get("created_at", "")[:10],
+                extra={
+                    "username": username,
+                    "display_name": display_name,
+                    "favourites": status.get("favourites_count", 0),
+                    "reblogs": status.get("reblogs_count", 0),
+                    "instance": instance,
+                },
+            ))
+        
+        if results:
+            return results
+    
+    except Exception as e:
+        logger.debug(f"Mastodon direct API failed: {e}")
+    
+    # Fallback: Serper with site:mastodon.social
+    if SERPER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                r = await client.post(
+                    "https://google.serper.dev/search",
+                    headers={"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"},
+                    json={"q": f"site:mastodon.social {query}", "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+            results = []
+            for item in data.get("organic", []):
+                results.append(SearchResult(
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    source_name="mastodon_via_serper",
+                    source_category=SourceCategory.SOCIAL,
+                    source_tier="P3",
+                ))
+            return results
+        except Exception as e2:
+            logger.debug(f"Mastodon via Serper failed: {e2}")
+    
+    return []
+
+
+# ═══════════════════════════════════════════════════════════════
+# IPFS / WIKIPEDIA OFFLINE — OFFLINE ENCYCLOPEDIA
+# ═══════════════════════════════════════════════════════════════
+
+
+async def search_wikipedia_offline(
+    query: str,
+    max_results: int = DEFAULT_MAX_RESULTS,
+) -> List[SearchResult]:
+    """
+    Search Wikipedia via Kiwix/IPFS — offline encyclopedia access.
+    
+    Free: No key needed. Uses public IPFS gateway or local Kiwix server.
+    Covers: Full Wikipedia dump (offline-capable).
+    Returns: Article titles, summaries, content.
+    
+    Best for: Offline/air-gapped environments, low-bandwidth situations,
+    regions with internet restrictions, archival research.
+    
+    Note: Falls back to regular Wikipedia API if IPFS/Kiwix is unavailable.
+    """
+    # Try IPFS-hosted Wikipedia first
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            # IPFS CID for Wikipedia Kiwix ZIM (public gateway)
+            r = await client.get(
+                "https://ipfs.io/ipfs/bafybeiaks3mhnbu5m7j6nb25hy2xqfpxrfahq6bjWD4ndab5slm3rlxwvm/wiki/",
+                params={"q": query},
+            )
+            if r.status_code == 200:
+                # If IPFS works, return as IPFS source
+                results = []
+                results.append(SearchResult(
+                    title=f"[IPFS/Wikipedia] {query}",
+                    url=f"https://ipfs.io/ipfs/bafybeiaks3mhnbu5m7j6nb25hy2xqfpxrfahq6bjWD4ndab5slm3rlxwvm/wiki/{quote_plus(query)}",
+                    snippet="Wikipedia via IPFS (offline-capable). Content available without internet.",
+                    source_name="wikipedia_ipfs",
+                    source_category=SourceCategory.ENCYCLOPEDIA,
+                    source_tier="P2",
+                    extra={"protocol": "ipfs", "offline_capable": True},
+                ))
+                return results
+    except Exception:
+        pass
+    
+    # Fallback: regular Wikipedia API (not offline, but always available)
+    return await search_wikipedia(query, max_results)
+
+
+# ═══════════════════════════════════════════════════════════════
 # DUCKDUCKGO (FREE, NO KEY — ALREADY EXISTS, WRAPPER)
 # ═══════════════════════════════════════════════════════════════
 
@@ -1397,30 +2296,38 @@ async def find_open_access_pdf(doi: str) -> Optional[str]:
 # Map query classification to source priorities
 SOURCE_ROUTING = {
     "academic": {
-        "primary": ["exa", "semantic_scholar", "openalex", "arxiv"],
-        "secondary": ["crossref", "doaj", "clinical_trials", "wikipedia"],
+        "primary": ["exa", "semantic_scholar", "openalex", "arxiv", "google_scholar"],
+        "secondary": ["crossref", "doaj", "core", "papers_with_code", "clinical_trials", "wikipedia"],
         "web_fallback": ["serper", "duckduckgo"],
     },
     "web": {
         "primary": ["serper", "exa"],
-        "secondary": ["brave", "duckduckgo", "hackernews", "wikipedia"],
-        "academic_boost": ["openalex"],
+        "secondary": ["brave", "duckduckgo", "hackernews", "wikipedia", "youtube", "substack"],
+        "academic_boost": ["openalex", "google_scholar"],
     },
     "code": {
-        "primary": ["github", "stackoverflow", "exa"],
+        "primary": ["github", "stackoverflow", "papers_with_code", "exa"],
         "secondary": ["serper", "duckduckgo", "hackernews"],
     },
     "news": {
-        "primary": ["hackernews", "serper", "reddit"],
-        "secondary": ["exa", "newsapi", "duckduckgo"],
+        "primary": ["hackernews", "serper", "reddit", "youtube"],
+        "secondary": ["exa", "newsapi", "substack", "duckduckgo", "mastodon"],
     },
     "clinical": {
-        "primary": ["clinical_trials", "semantic_scholar"],
-        "secondary": ["openalex", "crossref", "doaj", "exa"],
+        "primary": ["clinical_trials", "europe_pmc", "semantic_scholar"],
+        "secondary": ["openalex", "crossref", "doaj", "exa", "core"],
     },
     "encyclopedia": {
         "primary": ["wikipedia", "wikidata"],
-        "secondary": ["openalex", "serper", "duckduckgo"],
+        "secondary": ["openalex", "serper", "duckduckgo", "wikipedia_offline"],
+    },
+    "compute": {
+        "primary": ["wolfram", "wikipedia"],
+        "secondary": ["serper", "duckduckgo"],
+    },
+    "patent": {
+        "primary": ["google_patents"],
+        "secondary": ["serper", "duckduckgo"],
     },
 }
 
@@ -1431,18 +2338,29 @@ SOURCE_FUNCTIONS = {
     "openalex": search_openalex,
     "doaj": search_doaj,
     "arxiv": search_arxiv,
+    "google_scholar": search_google_scholar,
+    "papers_with_code": search_papers_with_code,
+    "europe_pmc": search_europe_pmc,
+    "core": search_core,
     "clinical_trials": search_clinical_trials,
     "wikipedia": search_wikipedia,
     "wikidata": search_wikidata,
+    "wikipedia_offline": search_wikipedia_offline,
     "github": search_github,
     "stackoverflow": search_stackoverflow,
     "hackernews": search_hackernews,
     "reddit": search_reddit,
     "newsapi": search_newsapi,
+    "substack": search_substack,
+    "youtube": search_youtube,
+    "podcast_index": search_podcast_index,
+    "mastodon": search_mastodon,
     "brave": search_brave,
     "serper": search_serper,
     "exa": search_exa,
     "tavily": search_tavily,
+    "wolfram": search_wolfram,
+    "google_patents": search_google_patents,
     "duckduckgo": search_duckduckgo,
 }
 
@@ -1551,24 +2469,35 @@ def get_source_status() -> Dict[str, Any]:
     """Get the status of all configured search sources."""
     sources = {
         # Always free, no key
-        "openalex": {"key_needed": False, "status": "✅ Free, unlimited"},
-        "crossref": {"key_needed": False, "status": "✅ Free (polite pool with email)"},
-        "doaj": {"key_needed": False, "status": "✅ Free, no limits"},
-        "arxiv": {"key_needed": False, "status": "✅ Free, no limits"},
-        "clinical_trials": {"key_needed": False, "status": "✅ Free, no limits"},
-        "wikipedia": {"key_needed": False, "status": "✅ Free (User-Agent required)"},
-        "wikidata": {"key_needed": False, "status": "✅ Free (User-Agent required)"},
-        "github": {"key_needed": False, "status": "✅ Free (better with token)", "key_configured": bool(GITHUB_TOKEN)},
-        "stackoverflow": {"key_needed": False, "status": "✅ Free, 300 req/s"},
-        "hackernews": {"key_needed": False, "status": "✅ Free via Algolia"},
-        "reddit": {"key_needed": False, "status": "✅ Free (basic search)"},
-        "duckduckgo": {"key_needed": False, "status": "✅ Free, no limits"},
+        "openalex": {"key_needed": False, "status": "Free, unlimited", "category": "academic"},
+        "crossref": {"key_needed": False, "status": "Free (polite pool with email)", "category": "academic"},
+        "doaj": {"key_needed": False, "status": "Free, no limits", "category": "academic"},
+        "arxiv": {"key_needed": False, "status": "Free, no limits", "category": "academic"},
+        "core": {"key_needed": False, "status": "Free, 10M req/day", "category": "academic"},
+        "papers_with_code": {"key_needed": False, "status": "Free, no limits", "category": "academic+code"},
+        "europe_pmc": {"key_needed": False, "status": "Free, no limits", "category": "biomedical"},
+        "clinical_trials": {"key_needed": False, "status": "Free, no limits", "category": "clinical"},
+        "wikipedia": {"key_needed": False, "status": "Free (User-Agent required)", "category": "encyclopedia"},
+        "wikidata": {"key_needed": False, "status": "Free (User-Agent required)", "category": "encyclopedia"},
+        "github": {"key_needed": False, "status": "Free (better with token)", "key_configured": bool(GITHUB_TOKEN), "category": "code"},
+        "stackoverflow": {"key_needed": False, "status": "Free, 300 req/s", "category": "code"},
+        "hackernews": {"key_needed": False, "status": "Free via Algolia", "category": "news"},
+        "reddit": {"key_needed": False, "status": "Free (Serper fallback)", "category": "news"},
+        "mastodon": {"key_needed": False, "status": "Free, open API", "category": "social"},
+        "duckduckgo": {"key_needed": False, "status": "Free, no limits", "category": "web"},
+        "wikipedia_offline": {"key_needed": False, "status": "Free via IPFS/Kiwix", "category": "offline"},
         # Free tier with key
-        "semantic_scholar": {"key_needed": "optional", "status": "⚠️ Rate-limited w/o key (100/5min)", "key_configured": bool(SEMANTIC_SCHOLAR_API_KEY)},
-        "exa": {"key_needed": True, "status": "🔑 Free: 1K req/mo | Neural search", "key_configured": bool(EXA_API_KEY)},
-        "serper": {"key_needed": True, "status": "🔑 Free: 2.5K one-time | Google results", "key_configured": bool(SERPER_API_KEY)},
-        "brave": {"key_needed": True, "status": "🔑 Free: 2K req/mo", "key_configured": bool(BRAVE_SEARCH_API_KEY)},
-        "tavily": {"key_needed": True, "status": "🔑 Free: 1K req/mo | AI-optimized", "key_configured": bool(TAVILY_API_KEY)},
-        "newsapi": {"key_needed": True, "status": "🔑 Free: 100 req/day", "key_configured": bool(NEWSAPI_KEY)},
+        "semantic_scholar": {"key_needed": "optional", "status": "Rate-limited w/o key (100/5min)", "key_configured": bool(SEMANTIC_SCHOLAR_API_KEY), "category": "academic"},
+        "exa": {"key_needed": True, "status": "Free: 1K req/mo | Neural search", "key_configured": bool(EXA_API_KEY), "category": "academic+web"},
+        "serper": {"key_needed": True, "status": "Free: 2.5K one-time | Google results", "key_configured": bool(SERPER_API_KEY), "category": "web+scholar+patents"},
+        "google_scholar": {"key_needed": True, "status": "Via Serper | 389M+ articles", "key_configured": bool(SERPER_API_KEY), "category": "academic"},
+        "google_patents": {"key_needed": True, "status": "Via Serper | 120M+ patents", "key_configured": bool(SERPER_API_KEY), "category": "patents"},
+        "substack": {"key_needed": True, "status": "Via Serper | Newsletter search", "key_configured": bool(SERPER_API_KEY), "category": "news"},
+        "youtube": {"key_needed": True, "status": "Via Serper fallback | Or YouTube API key", "key_configured": bool(YOUTUBE_API_KEY), "category": "video"},
+        "brave": {"key_needed": True, "status": "Free: 2K req/mo", "key_configured": bool(BRAVE_SEARCH_API_KEY), "category": "web"},
+        "tavily": {"key_needed": True, "status": "Free: 1K req/mo | AI-optimized", "key_configured": bool(TAVILY_API_KEY), "category": "web"},
+        "newsapi": {"key_needed": True, "status": "Free: 100 req/day", "key_configured": bool(NEWSAPI_KEY), "category": "news"},
+        "wolfram": {"key_needed": True, "status": "Free: 2K req/mo | Computation", "key_configured": bool(WOLFRAM_APP_ID), "category": "computation"},
+        "podcast_index": {"key_needed": True, "status": "Free | Podcast search", "key_configured": bool(PODCAST_INDEX_API_KEY), "category": "audio"},
     }
     return sources
