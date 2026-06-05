@@ -1,0 +1,24 @@
+{
+  "name": "apex-research-agent",
+  "version": "2.1.0",
+  "description": "APEX Research Agent 2.1 — Serverless Cloudflare Worker with D1 + R2 + Vectorize + Workers AI + LLM Wiki",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail",
+    "db:init": "wrangler d1 execute apex-db --file=./schema.sql",
+    "db:wiki": "wrangler d1 execute apex-db --file=./wiki-schema.sql",
+    "db:local-wiki": "wrangler d1 execute apex-db --local --file=./wiki-schema.sql",
+    "db:seed": "wrangler d1 execute apex-db --file=./seed.sql",
+    "db:local": "wrangler d1 execute apex-db --local --file=./schema.sql",
+    "vectorize:create": "wrangler vectorize create apex-vectors --dimensions=768 --metric=cosine",
+    "test": "vitest"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "typescript": "^5.7.0",
+    "wrangler": "^3.101.0",
+    "vitest": "^2.1.0"
+  }
+}

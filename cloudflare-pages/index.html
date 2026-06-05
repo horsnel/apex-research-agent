@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>APEX Research Agent</title>
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --surface: #12121a;
+      --border: #1e1e2e;
+      --text: #e4e4ef;
+      --muted: #8888a0;
+      --accent: #22c55e;
+      --accent-dim: rgba(34, 197, 94, 0.12);
+    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem;
+    }
+    .card {
+      max-width: 560px;
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 3rem 2.5rem;
+      text-align: center;
+    }
+    .logo {
+      width: 64px;
+      height: 64px;
+      margin: 0 auto 1.5rem;
+      background: var(--accent-dim);
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+    }
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.5rem;
+    }
+    .tagline {
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.6;
+      margin-bottom: 2rem;
+    }
+    .endpoints {
+      text-align: left;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 2rem;
+    }
+    .endpoint {
+      display: flex;
+      align-items: baseline;
+      gap: 0.75rem;
+      padding: 0.5rem 0;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 0.85rem;
+    }
+    .endpoint + .endpoint { border-top: 1px solid var(--border); }
+    .method {
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 3.5rem;
+    }
+    .path { color: var(--text); }
+    .desc { color: var(--muted); margin-left: auto; font-family: inherit; font-size: 0.8rem; }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.35rem 0.9rem;
+      border-radius: 9999px;
+      background: var(--accent-dim);
+      color: var(--accent);
+      font-size: 0.8rem;
+      font-weight: 600;
+      margin-bottom: 1rem;
+    }
+    .status-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .footer {
+      margin-top: 1.5rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .footer a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      .card { padding: 2rem 1.25rem; }
+      .desc { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">&#9889;</div>
+    <h1>APEX Research Agent</h1>
+    <p class="tagline">
+      AI-powered deep research and synthesis engine.
+      Proxied through Cloudflare Pages for low-latency global access.
+    </p>
+
+    <div class="status-badge">
+      <span class="status-dot"></span>
+      Proxy Online
+    </div>
+
+    <div class="endpoints">
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <span class="path">/research/health</span>
+        <span class="desc">Health check</span>
+      </div>
+      <div class="endpoint">
+        <span class="method">POST</span>
+        <span class="path">/research/research</span>
+        <span class="desc">Start research</span>
+      </div>
+      <div class="endpoint">
+        <span class="method">POST</span>
+        <span class="path">/research/query</span>
+        <span class="desc">Query papers</span>
+      </div>
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <span class="path">/research/status/:id</span>
+        <span class="desc">Job status (SSE)</span>
+      </div>
+    </div>
+
+    <p class="footer">
+      Upstream: <a href="https://apex-research-agent-production.up.railway.app" target="_blank" rel="noopener">Railway</a>
+      &nbsp;&middot;&nbsp;
+      Edge: <a href="https://kovira.pages.dev" target="_blank" rel="noopener">Cloudflare Pages</a>
+    </p>
+  </div>
+
+  <script>
+    // Lightweight health-check: ping the proxy endpoint and show result
+    (async () => {
+      try {
+        const res = await fetch('/research/health', { signal: AbortSignal.timeout(5000) });
+        const data = await res.json().catch(() => null);
+        const badge = document.querySelector('.status-badge');
+        if (res.ok) {
+          badge.innerHTML = '<span class="status-dot"></span> API Healthy';
+        } else {
+          badge.innerHTML = '&#x26A0; API Degraded';
+          badge.style.background = 'rgba(250,204,21,0.12)';
+          badge.style.color = '#facc15';
+        }
+      } catch {
+        const badge = document.querySelector('.status-badge');
+        badge.innerHTML = '&#x2717; API Unreachable';
+        badge.style.background = 'rgba(239,68,68,0.12)';
+        badge.style.color = '#ef4444';
+      }
+    })();
+  </script>
+</body>
+</html>

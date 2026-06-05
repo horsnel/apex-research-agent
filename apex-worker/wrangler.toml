@@ -1,0 +1,59 @@
+#: APEX Research Agent — Cloudflare Worker Configuration
+#: Fully serverless: Workers AI + D1 + R2 + Vectorize
+
+name = "apex-research-agent"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Workers AI Binding ──
+# No explicit config needed — AI binding is automatic when Workers AI is enabled
+# Access via: env.AI.run(model, inputs)
+
+[ai]
+binding = "AI"
+
+# ── D1 Database ──
+# Create with: npx wrangler d1 create apex-db
+# Then paste the database_id below
+[[d1_databases]]
+binding = "DB"
+database_name = "apex-db"
+database_id = "REPLACE_AFTER_CREATE"
+
+# ── R2 Bucket ──
+# Create with: npx wrangler r2 bucket create apex-documents
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "apex-documents"
+
+# ── Vectorize Index ──
+# Create with: npx wrangler vectorize create apex-vectors --dimensions=768 --metric=cosine
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "apex-vectors"
+
+# ── Environment Variables ──
+[vars]
+ENVIRONMENT = "production"
+DEFAULT_SYNTHESIS_TOKENS = "150"
+MAX_SYNTHESIS_TOKENS = "300"
+SIMILARITY_THRESHOLD = "0.72"
+PASS_THROUGH_THRESHOLD = "0.85"
+RAG_TOP_K = "5"
+RAG_FINAL_K = "3"
+MAX_RAG_CONTEXT_TOKENS = "2000"
+
+# ── Secrets (set via: wrangler secret put <NAME>) ──
+# SERPER_API_KEY
+# COHERE_API_KEY
+# JINA_API_KEY
+# FIRECRAWL_API_KEY
+# NEWSAPI_KEY
+# YOUTUBE_API_KEY
+
+# ── Dev overrides ──
+[env.dev]
+name = "apex-research-agent-dev"
+[env.dev.vars]
+ENVIRONMENT = "development"

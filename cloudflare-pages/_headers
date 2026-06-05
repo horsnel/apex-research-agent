@@ -1,5 +1,13 @@
 /research/*
   Access-Control-Allow-Origin: https://kovira.pages.dev
-  Access-Control-Allow-Methods: GET, POST, OPTIONS
-  Access-Control-Allow-Headers: Content-Type, Authorization
-  X-Proxied-By: kovira-pages-proxy
+  Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD
+  Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, X-Request-ID
+  Access-Control-Max-Age: 86400
+  Access-Control-Allow-Credentials: true
+  Vary: Origin
+  X-Proxied-By: apex-cf-pages-proxy
+
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: strict-origin-when-cross-origin
