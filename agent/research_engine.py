@@ -1,8 +1,8 @@
 """
-APEX Competitive Research Engine — Verification, Iteration, and Structured Output.
+APEX 2.0 Competitive Research Engine — Verification, Iteration, Structured Output, and LLM Wiki.
 
 This module implements the 5 upgrades that make APEX competitive with
-Perplexity, Elicit, and Consensus:
+Perplexity, Elicit, and Consensus, PLUS the APEX 2.0 LLM Wiki pattern:
 
 1. Source Tier Enforcement — Hard domain-to-tier mapping + temporal decay
 2. Verification Loop — Multi-source corroboration with epistemic marking
@@ -11,7 +11,16 @@ Perplexity, Elicit, and Consensus:
 5. Iterative Research Loop — Opt-in multi-cycle with gap identification
 6. Structured Extraction — Claim/evidence extraction from P1 sources
 
-Design principle: "Perplexity retrieves and summarizes. APEX verifies and structures."
+APEX 2.0 additions:
+7. LLM Wiki Pattern — Raw sources (immutable) → Wiki (LLM-compiled) → Schema (config)
+8. Page Lifecycle (Synthadoc) — draft → active → stale → contradicted → archived
+9. Hot Cache (Claude-Obsidian) — Session continuity across research sessions
+10. SciMem Architecture — Scientific memory with provenance tracking
+11. Provenance/Conflict Detection — Track where info came from, detect contradictions
+12. Dialogic Wiki — Interactive dialogue around wiki topics
+13. Secure Wiki Layer + Concurrency Safety — Optimistic locking, edit conflicts
+
+Design principle: "Perplexity retrieves and summarizes. APEX verifies, structures, and compounds."
 """
 
 import asyncio
@@ -753,6 +762,13 @@ class ResearchReport:
     raw_report: str = ""
     total_latency_ms: int = 0
     depth: str = "quick"  # "quick" or "thorough"
+    # APEX 2.0 Wiki fields
+    wiki_page_id: Optional[str] = None
+    wiki_cache_id: Optional[str] = None
+    wiki_lifecycle: str = "draft"
+    wiki_slug: str = ""
+    wiki_version: int = 0
+    from_cache: bool = False
 
 
 async def generate_research_report(
@@ -760,23 +776,44 @@ async def generate_research_report(
     classification: str = "academic",
     depth: str = "quick",
     max_cycles: int = 3,
+    user_id: Optional[str] = None,
+    apex_tier: str = "apex-free",
 ) -> ResearchReport:
     """
     Generate a structured research report with verification.
 
-    This is the killer feature: a mini research report with
-    epistemic marking, claim-evidence tables, and debate surfacing.
+    APEX 2.0 pipeline: Research → Verify → Compile → Wiki → Cache
+    Every query compounds. Every claim is traceable.
 
     Args:
         query: Research query
         classification: Query type for routing
         depth: "quick" (1 cycle) or "thorough" (up to max_cycles)
         max_cycles: Max research cycles for thorough mode
+        user_id: Optional user ID for cache association
+        apex_tier: apex-free or apex-premium
 
     Returns:
-        ResearchReport with structured findings
+        ResearchReport with structured findings + wiki/cache metadata
     """
     start = time.time()
+
+    # ── APEX 2.0 Step 0: Check LLM Wiki cache ──
+    from agent.llm_wiki import get_wiki_engine
+    wiki_engine = get_wiki_engine()
+
+    cached = await wiki_engine.check_cache(query, depth, apex_tier, user_id)
+    if cached and cached.report:
+        logger.info(f"[APEX 2.0] Cache HIT for: {query[:50]}")
+        report = _parse_report(cached.report)
+        report.query = query
+        report.total_latency_ms = int((time.time() - start) * 1000)
+        report.depth = depth
+        report.sources = cached.sources if isinstance(cached.sources, list) else []
+        report.wiki_cache_id = cached.id
+        report.wiki_page_id = cached.wiki_page_id
+        report.from_cache = True
+        return report
 
     # Step 1: Parallel research
     research = await parallel_research(query, classification)
@@ -799,6 +836,36 @@ async def generate_research_report(
     report.total_latency_ms = int((time.time() - start) * 1000)
     report.depth = depth
     report.sources = research.results
+    report.from_cache = False
+
+    # ── APEX 2.0 Step 6: Compile into Wiki + Cache ──
+    try:
+        wiki_page, cache_id = await wiki_engine.research_to_wiki(
+            query=query,
+            report=raw_report,
+            sources=research.results,
+            verification=verification,
+            mode=depth,
+            apex_tier=apex_tier,
+            depth=depth,
+            category=classification,
+            user_id=user_id,
+            original_latency_ms=report.total_latency_ms,
+        )
+        report.wiki_page_id = wiki_page.id
+        report.wiki_cache_id = cache_id
+        report.wiki_lifecycle = wiki_page.lifecycle
+        report.wiki_slug = wiki_page.slug
+        report.wiki_version = wiki_page.version
+
+        logger.info(
+            f"[APEX 2.0] Wiki compiled: slug={wiki_page.slug}, "
+            f"lifecycle={wiki_page.lifecycle}, cache_id={cache_id}"
+        )
+    except Exception as e:
+        logger.warning(f"[APEX 2.0] Wiki compilation failed (non-fatal): {e}")
+        report.wiki_page_id = None
+        report.wiki_cache_id = None
 
     return report
 
