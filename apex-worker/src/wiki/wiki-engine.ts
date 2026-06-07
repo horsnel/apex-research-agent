@@ -88,19 +88,8 @@ function slugify(title: string): string {
 // ── D1 Row → WikiPage Conversion ──
 
 async function rowToWikiPage(env: Env, row: WikiPageRow): Promise<WikiPage> {
-  let content = '';
-
-  // Load full content from R2
-  try {
-    const r2Key = `wiki/pages/${row.slug}.md`;
-    const r2Object = await env.BUCKET.get(r2Key);
-    if (r2Object) {
-      content = await r2Object.text();
-    }
-  } catch {
-    // Fallback: use snippet
-    content = row.content_snippet || '';
-  }
+  // Load full content from D1 content_text column (replaces R2)
+  const content = row.content_text || row.content_snippet || '';
 
   return {
     id: row.id,
@@ -224,7 +213,7 @@ export async function ingestSources(
 
               await env.DB.prepare(`
                 UPDATE wiki_pages
-                SET title = ?, content_snippet = ?, source_hashes = ?, sources = ?,
+                SET title = ?, content_snippet = ?, content_text = ?, source_hashes = ?, sources = ?,
                     entities = ?, links = ?, metadata = ?, updated_at = ?,
                     last_verified_at = ?, verification_count = verification_count + 1,
                     version = ?, state = 'active'
@@ -232,6 +221,7 @@ export async function ingestSources(
               `).bind(
                 compiledPage.title,
                 snippet,
+                compiledPage.content,
                 JSON.stringify(compiledPage.sourceHashes),
                 JSON.stringify(compiledPage.sources),
                 JSON.stringify(compiledPage.entities),
@@ -243,10 +233,7 @@ export async function ingestSources(
                 existingPage.id,
               ).run();
 
-              // Store full content in R2
-              await env.BUCKET.put(`wiki/pages/${compiledPage.slug}.md`, compiledPage.content);
-
-              // Update embedding in Vectorize
+              // Update embedding in D1 (replaces Vectorize)
               await embedAndUpsert(env, `wiki-${compiledPage.slug}`, compiledPage.content, {
                 type: 'wiki',
                 slug: compiledPage.slug,
@@ -278,13 +265,14 @@ export async function ingestSources(
           const snippet = compiledPage.content.slice(0, 500);
 
           await env.DB.prepare(`
-            INSERT INTO wiki_pages (id, slug, title, content_snippet, state, category, source_hashes, sources, entities, links, metadata, created_at, updated_at, last_verified_at, verification_count, access_count, version)
-            VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+            INSERT INTO wiki_pages (id, slug, title, content_snippet, content_text, state, category, source_hashes, sources, entities, links, metadata, created_at, updated_at, last_verified_at, verification_count, access_count, version)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
           `).bind(
             pageId,
             compiledPage.slug,
             compiledPage.title,
             snippet,
+            compiledPage.content,
             request.category || null,
             JSON.stringify(compiledPage.sourceHashes),
             JSON.stringify(compiledPage.sources),
@@ -296,10 +284,7 @@ export async function ingestSources(
             now,
           ).run();
 
-          // Store full content in R2
-          await env.BUCKET.put(`wiki/pages/${compiledPage.slug}.md`, compiledPage.content);
-
-          // Embed and upsert to Vectorize
+          // Embed and upsert to D1 (replaces Vectorize)
           await embedAndUpsert(env, `wiki-${compiledPage.slug}`, compiledPage.content, {
             type: 'wiki',
             slug: compiledPage.slug,

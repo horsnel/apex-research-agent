@@ -321,13 +321,14 @@ export async function adversarialReview(
 
   const contentSnippet = (pageRow.content_snippet as string) || '';
 
-  // Load full content from R2
+  // Load full content from D1 content_text column (replaces R2)
   let fullContent = contentSnippet;
   try {
-    const r2Key = `wiki/pages/${pageRow.slug}.md`;
-    const r2Object = await env.BUCKET.get(r2Key);
-    if (r2Object) {
-      fullContent = await r2Object.text();
+    const contentRow = await env.DB.prepare(
+      'SELECT content_text FROM wiki_pages WHERE id = ?'
+    ).bind(pageId).first();
+    if (contentRow?.content_text) {
+      fullContent = contentRow.content_text as string;
     }
   } catch {
     // Use snippet

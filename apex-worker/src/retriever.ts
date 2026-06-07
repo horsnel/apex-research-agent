@@ -1,7 +1,7 @@
 /**
  * APEX Research Agent — Hybrid Retriever
- * Vectorize (vector search) + D1 FTS5 (keyword search) + RRF fusion
- * Replaces PostgreSQL pgvector + tsvector
+ * D1 cosine similarity (vector search) + D1 FTS5 (keyword search) + RRF fusion
+ * All storage in D1 — no R2 or Vectorize dependencies
  */
 
 import { Env, RetrievedChunk, DocumentRow } from './types';
@@ -84,7 +84,7 @@ async function vectorSearch(
   tierFilter?: string,
 ): Promise<RetrievedChunk[]> {
   try {
-    // Build filter for Vectorize
+    // Build filter for vector search
     const filter: Record<string, string> = {};
     if (domainFilter) filter.domain = domainFilter;
     if (tierFilter) filter.tier = tierFilter;
@@ -93,35 +93,32 @@ async function vectorSearch(
 
     if (!matches || matches.length === 0) return [];
 
-    // Fetch document metadata from D1 by IDs
-    const ids = matches.map(m => m.id);
-    const placeholders = ids.map(() => '?').join(',');
-    const dbResult = await env.DB.prepare(
-      `SELECT * FROM documents WHERE id IN (${placeholders})`
-    ).bind(...ids).all();
+    // Separate wiki and document matches
+    const docIds = matches.filter(m => m.metadata.type !== 'wiki').map(m => m.id);
+    const wikiIds = matches.filter(m => m.metadata.type === 'wiki').map(m => m.id);
 
+    // Fetch document metadata from D1 by IDs
     const docMap = new Map<string, DocumentRow>();
-    for (const row of (dbResult.results || [])) {
-      docMap.set(row.id as string, row as unknown as DocumentRow);
+    if (docIds.length > 0) {
+      const placeholders = docIds.map(() => '?').join(',');
+      const dbResult = await env.DB.prepare(
+        `SELECT * FROM documents WHERE id IN (${placeholders})`
+      ).bind(...docIds).all();
+      for (const row of (dbResult.results || [])) {
+        docMap.set(row.id as string, row as unknown as DocumentRow);
+      }
     }
 
-    // Fetch full text from R2 for matched documents
+    // Fetch full text from D1 content_text column (replaces R2)
     const chunks: RetrievedChunk[] = [];
     for (const match of matches) {
+      if (match.metadata.type === 'wiki') continue; // Skip wiki results in document search
+      
       const doc = docMap.get(match.id);
       if (!doc) continue;
 
-      let rawText = doc.text_snippet || '';
-      if (doc.r2_key) {
-        try {
-          const r2Object = await env.BUCKET.get(doc.r2_key);
-          if (r2Object) {
-            rawText = await r2Object.text();
-          }
-        } catch {
-          // Fall back to snippet
-        }
-      }
+      // Use content_text from D1 instead of R2
+      const rawText = doc.content_text || doc.text_snippet || '';
 
       const authors: string[] = doc.authors ? JSON.parse(doc.authors) : [];
 
@@ -185,13 +182,7 @@ async function keywordSearch(
       const authors: string[] = doc.authors ? JSON.parse(doc.authors) : [];
       const rank = Math.abs(row.rank as number || 0);
 
-      let rawText = doc.text_snippet || '';
-      if (doc.r2_key) {
-        try {
-          const r2Object = await env.BUCKET.get(doc.r2_key);
-          if (r2Object) rawText = await r2Object.text();
-        } catch { /* fallback to snippet */ }
-      }
+      let rawText = (doc as any).content_text || doc.text_snippet || '';
 
       chunks.push({
         id: doc.id,

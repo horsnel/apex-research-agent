@@ -19,19 +19,21 @@ binding = "AI"
 [[d1_databases]]
 binding = "DB"
 database_name = "apex-db"
-database_id = "REPLACE_AFTER_CREATE"
+database_id = "50f0ec88-23f7-4ca4-a3f4-f6d11b9a8949"
 
 # ── R2 Bucket ──
 # Create with: npx wrangler r2 bucket create apex-documents
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "apex-documents"
+# NOTE: R2 not yet enabled on account — commented out until enabled
+# [[r2_buckets]]
+# binding = "BUCKET"
+# bucket_name = "apex-documents"
 
 # ── Vectorize Index ──
 # Create with: npx wrangler vectorize create apex-vectors --dimensions=768 --metric=cosine
-[[vectorize]]
-binding = "VECTORIZE"
-index_name = "apex-vectors"
+# NOTE: Vectorize not yet available with current token permissions — commented out
+# [[vectorize]]
+# binding = "VECTORIZE"
+# index_name = "apex-vectors"
 
 # ── Environment Variables ──
 [vars]

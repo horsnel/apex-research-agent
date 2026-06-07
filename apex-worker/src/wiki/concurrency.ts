@@ -214,14 +214,14 @@ Rules:
         );
 
         if (!result.content.startsWith('[ALL_LLM_FAILED]')) {
-          // Store merged content
+          // Store merged content in D1 content_text (replaces R2)
           const slug = await env.DB.prepare('SELECT slug FROM wiki_pages WHERE id = ?').bind(pageId).first();
           if (slug?.slug) {
-            await env.BUCKET.put(`wiki/pages/${slug.slug}.md`, result.content);
             await env.DB.prepare(`
-              UPDATE wiki_pages SET content_snippet = ?, version = version + 1, updated_at = ? WHERE id = ?
+              UPDATE wiki_pages SET content_snippet = ?, content_text = ?, version = version + 1, updated_at = ? WHERE id = ?
             `).bind(
               result.content.slice(0, 500),
+              result.content,
               new Date().toISOString(),
               pageId,
             ).run();

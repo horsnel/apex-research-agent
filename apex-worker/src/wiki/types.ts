@@ -272,6 +272,8 @@ export interface WikiPageRow {
   slug: string;
   title: string;
   content_snippet: string | null;
+  content_text: string | null;        // Full markdown content (replaces R2)
+  embedding: string | null;           // JSON array of floats (replaces Vectorize)
   state: string;
   category: string | null;
   source_hashes: string | null;

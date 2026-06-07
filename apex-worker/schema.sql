@@ -1,9 +1,9 @@
 -- APEX Research Agent — D1 Schema (SQLite)
--- Replaces PostgreSQL + pgvector with D1 + Vectorize + R2
--- Vectors are stored in Vectorize, full text in R2, metadata in D1
+-- D1-only storage: metadata, full text, and embeddings all in D1
+-- No R2 or Vectorize dependencies
 
 -- ── Main documents table ──
--- Vectors live in Vectorize index, full text lives in R2 bucket
+-- All data stored in D1: metadata, full text (content_text), embeddings (embedding)
 CREATE TABLE IF NOT EXISTS documents (
     id TEXT PRIMARY KEY,  -- UUID generated in Worker
     source_url TEXT NOT NULL,
@@ -14,7 +14,9 @@ CREATE TABLE IF NOT EXISTS documents (
     title TEXT,
     authors TEXT,         -- JSON array: '["Author A","Author B"]'
     text_snippet TEXT,    -- First 500 chars for preview / FTS5 source
-    r2_key TEXT,          -- R2 object key: 'docs/{hash}/{chunk_index}.txt'
+    r2_key TEXT,          -- Deprecated — kept for backward compat
+    content_text TEXT,    -- Full document chunk text (replaces R2)
+    embedding TEXT,       -- JSON array of floats (replaces Vectorize)
     chunk_index INTEGER DEFAULT 0,
     total_chunks INTEGER DEFAULT 1,
     metadata TEXT,        -- JSON object

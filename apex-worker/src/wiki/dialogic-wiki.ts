@@ -189,19 +189,20 @@ export async function preserveContradiction(
     // Update existing contradiction page
     await env.DB.prepare(`
       UPDATE wiki_pages
-      SET content_snippet = ?, updated_at = ?, state = 'active'
+      SET content_snippet = ?, content_text = ?, updated_at = ?, state = 'active'
       WHERE slug = ?
-    `).bind(snippet, now, slug).run();
+    `).bind(snippet, dialecticalContent, now, slug).run();
   } else {
-    // Create new contradiction page
+    // Create new contradiction page with content_text (replaces R2)
     await env.DB.prepare(`
-      INSERT INTO wiki_pages (id, slug, title, content_snippet, state, category, source_hashes, sources, entities, links, metadata, created_at, updated_at, last_verified_at, verification_count, access_count, version)
-      VALUES (?, ?, ?, ?, 'active', 'contradiction', ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+      INSERT INTO wiki_pages (id, slug, title, content_snippet, content_text, state, category, source_hashes, sources, entities, links, metadata, created_at, updated_at, last_verified_at, verification_count, access_count, version)
+      VALUES (?, ?, ?, ?, ?, 'active', 'contradiction', ?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
     `).bind(
       pageId,
       slug,
       `Contradiction: ${record.topic}`,
       snippet,
+      dialecticalContent,
       JSON.stringify([]),
       JSON.stringify([]),
       JSON.stringify([]),
@@ -212,9 +213,6 @@ export async function preserveContradiction(
       now,
     ).run();
   }
-
-  // Store full content in R2
-  await env.BUCKET.put(`wiki/pages/${slug}.md`, dialecticalContent);
 
   return {
     ...record,

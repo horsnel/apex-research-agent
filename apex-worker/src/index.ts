@@ -1,6 +1,6 @@
 /**
  * APEX Research Agent 2.1 — Cloudflare Worker Entry Point
- * Fully serverless: Workers AI + D1 + R2 + Vectorize + LLM Wiki
+ * Fully serverless: Workers AI + D1 + LLM Wiki (D1-only storage)
  *
  * Endpoints:
  *   GET  /health          — Health check
@@ -108,8 +108,6 @@ export default {
 
 async function handleHealth(env: Env, request: Request): Promise<Response> {
   let dbStatus = 'not_configured';
-  let vectorizeStatus = 'not_configured';
-  let r2Status = 'not_configured';
 
   // Check D1
   try {
@@ -117,26 +115,6 @@ async function handleHealth(env: Env, request: Request): Promise<Response> {
     dbStatus = `connected (${result?.count || 0} docs)`;
   } catch (err: any) {
     dbStatus = `error: ${err.message?.slice(0, 80) || 'unknown'}`;
-  }
-
-  // Check Vectorize
-  try {
-    const testQuery = await env.VECTORIZE.query({
-      vector: new Array(768).fill(0),
-      topK: 1,
-    });
-    vectorizeStatus = 'connected';
-  } catch (err: any) {
-    vectorizeStatus = `error: ${err.message?.slice(0, 80) || 'unknown'}`;
-  }
-
-  // Check R2
-  try {
-    // Just list with limit 0 to test access
-    await env.BUCKET.list({ limit: 1 });
-    r2Status = 'connected';
-  } catch (err: any) {
-    r2Status = `error: ${err.message?.slice(0, 80) || 'unknown'}`;
   }
 
   // Check Wiki
@@ -152,8 +130,6 @@ async function handleHealth(env: Env, request: Request): Promise<Response> {
     status: 'healthy',
     version: '2.1.0-worker',
     database: dbStatus,
-    vectorize: vectorizeStatus,
-    r2: r2Status,
     wiki: wikiStatus,
   };
 
@@ -387,7 +363,7 @@ async function handleVerify(env: Env, request: Request): Promise<Response> {
 function handleResearchStatus(request: Request): Response {
   return jsonResponse({
     version: '2.1-worker',
-    architecture: 'cloudflare_worker+d1+r2+vectorize+llm_wiki',
+    architecture: 'cloudflare_worker+d1+llm_wiki',
     upgrades: {
       tier_enforcement: { status: 'active', P1_domains: 14, P2_domains: 9, P3_domains: 5 },
       verification_loop: { status: 'active', epistemic_markers: ['ESTABLISHED', 'TENTATIVE', 'ACTIVE_DEBATE', 'SPECULATIVE', 'UNVERIFIED'] },
@@ -455,30 +431,27 @@ async function handleIngestUrl(env: Env, request: Request, ctx: ExecutionContext
     let upserted = 0;
     for (let i = 0; i < chunks.length; i++) {
       const id = generateUUID();
-      const r2Key = `docs/${await hashText(body.url)}/${i}.txt`;
 
-      // Store full text in R2
-      ctx.waitUntil(
-        env.BUCKET.put(r2Key, chunks[i])
-      );
-
-      // Embed and upsert to Vectorize
+      // Embed and store in D1 (replaces Vectorize)
       const embedding = await embedAndUpsert(env, id, chunks[i], {
         source_url: body.url,
         domain,
         tier,
       });
+      const embeddingJson = JSON.stringify(Array.from(embedding));
 
-      // Insert metadata into D1
+      // Insert metadata + full content + embedding into D1 (replaces R2 + Vectorize)
       await env.DB.prepare(`
-        INSERT OR REPLACE INTO documents (id, source_url, source_tier, domain, doc_type, title, authors, text_snippet, r2_key, chunk_index, total_chunks, metadata, token_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT OR REPLACE INTO documents (id, source_url, source_tier, domain, doc_type, title, authors, text_snippet, content_text, embedding, chunk_index, total_chunks, metadata, token_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).bind(
         id, body.url, tier, domain, body.doc_type || 'article',
         body.title || null,
         body.authors ? JSON.stringify(body.authors) : null,
         chunks[i].slice(0, 500),
-        r2Key, i, chunks.length,
+        chunks[i],
+        embeddingJson,
+        i, chunks.length,
         JSON.stringify({ publishedDate: null }),
         Math.ceil(chunks[i].length / 4),
       ).run();

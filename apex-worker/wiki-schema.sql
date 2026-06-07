@@ -1,15 +1,19 @@
 -- APEX 2.0 — LLM Wiki D1 Schema (SQLite)
 -- Persistent knowledge layer: wiki pages, knowledge graph, provenance, contradictions,
 -- security audit, concurrency locks, and session hot cache
+-- D1-only storage: full content and embeddings stored in D1 (no R2/Vectorize)
 
 -- ── Wiki Pages ──
--- Full markdown content stored in R2 (key = wiki/pages/{slug}.md)
+-- Full markdown content stored in content_text column (D1-only, replaces R2)
+-- Embeddings stored in embedding column as JSON (D1-only, replaces Vectorize)
 -- D1 stores metadata and a text snippet for FTS5
 CREATE TABLE IF NOT EXISTS wiki_pages (
     id TEXT PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE,
     title TEXT NOT NULL,
     content_snippet TEXT,          -- First 500 chars for preview / FTS5
+    content_text TEXT,             -- Full markdown content (replaces R2)
+    embedding TEXT,                -- JSON array of floats (replaces Vectorize)
     state TEXT NOT NULL CHECK(state IN ('draft','active','stale','contradicted','archived')) DEFAULT 'draft',
     category TEXT,
     source_hashes TEXT,           -- JSON array of SHA-256 hashes: '["abc123","def456"]'

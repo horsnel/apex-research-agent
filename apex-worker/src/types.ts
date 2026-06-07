@@ -8,8 +8,7 @@
 export interface Env {
   AI: Ai;                              // Workers AI binding
   DB: D1Database;                       // D1 database binding
-  BUCKET: R2Bucket;                     // R2 bucket binding
-  VECTORIZE: VectorizeIndex;            // Vectorize index binding
+  // R2 and Vectorize removed — all storage is now D1-only
   ENVIRONMENT: string;
   DEFAULT_SYNTHESIS_TOKENS: string;
   MAX_SYNTHESIS_TOKENS: string;
@@ -317,8 +316,6 @@ export interface HealthResponse {
   status: string;
   version: string;
   database: string;
-  vectorize: string;
-  r2: string;
   wiki?: string;
 }
 
@@ -334,7 +331,9 @@ export interface DocumentRow {
   title: string | null;
   authors: string | null;  // JSON
   text_snippet: string | null;
-  r2_key: string | null;
+  r2_key: string | null;           // Deprecated — kept for backward compat
+  content_text: string | null;     // Full document chunk text (replaces R2)
+  embedding: string | null;        // JSON array of floats (replaces Vectorize)
   chunk_index: number;
   total_chunks: number;
   metadata: string | null;  // JSON
