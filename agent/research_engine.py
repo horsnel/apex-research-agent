@@ -139,6 +139,11 @@ def tier_enforce(sources: List[Dict]) -> List[Dict]:
     - P3 only as last resort, max 3, with [UNVERIFIED] warning
     - Always include at least 1 source if available
 
+    NOTE: This hard-truncates to 5 sources and is only appropriate for the
+    token-efficient CHAT path. The report path must use select_diverse_sources()
+    instead, which preserves breadth (comparative analysis and debate sections
+    need 20-30 diverse sources, not 5).
+
     Args:
         sources: List of source dicts with 'url', 'tier', 'title', etc.
 
@@ -176,44 +181,376 @@ def tier_enforce(sources: List[Dict]) -> List[Dict]:
     return result if result else sources[:3]
 
 
-def apply_temporal_decay(
+# ═══════════════════════════════════════════════════════════════
+# CANONICAL DEDUP + DIVERSE SOURCE SELECTION (report-grade)
+# ═══════════════════════════════════════════════════════════════
+
+def _normalize_doi(doi: Optional[str]) -> str:
+    """
+    Normalize a DOI to its canonical lowercase form.
+
+    Handles: "10.1038/xxx", "https://doi.org/10.1038/xxx",
+    "http://dx.doi.org/10.1038/xxx", "doi:10.1038/xxx"
+    """
+    if not doi:
+        return ""
+    d = str(doi).strip().lower()
+    for prefix in ("https://doi.org/", "http://doi.org/",
+                   "https://dx.doi.org/", "http://dx.doi.org/", "doi:"):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+    return d.strip()
+
+
+def _title_fingerprint(title: Optional[str]) -> str:
+    """
+    Produce a fuzzy fingerprint for a paper title.
+
+    Lowercase, alphanumeric-only, first 120 chars. Catches the same paper
+    returned by arXiv / Semantic Scholar / OpenAlex / Crossref with slightly
+    different punctuation or capitalization.
+    """
+    if not title:
+        return ""
+    alnum = re.sub(r'[^a-z0-9]+', '', title.lower())
+    return alnum[:120]
+
+
+def dedup_sources_canonical(sources: List[Dict]) -> List[Dict]:
+    """
+    Deduplicate sources by canonical identity: DOI first, then title fingerprint.
+
+    The same paper discovered via arXiv + Semantic Scholar + OpenAlex would
+    otherwise (a) waste context slots and (b) create FALSE independence during
+    verification (different domains, same underlying study).
+
+    On merge, keeps the record with the richest metadata (longest snippet),
+    accumulates alternate URLs into 'also_found_in', and preserves the best
+    score / tier / citation_count / DOI / authors across duplicates.
+
+    Args:
+        sources: List of source dicts
+
+    Returns:
+        Deduplicated list (order preserved by first appearance)
+    """
+    if not sources:
+        return []
+
+    by_doi: Dict[str, int] = {}
+    by_title: Dict[str, int] = {}
+    deduped: List[Dict] = []
+
+    def _merge(existing: Dict, dup: Dict) -> None:
+        # Richest record wins canonical identity: if the duplicate carries a
+        # longer snippet, adopt its URL/title/snippet as primary and demote
+        # the old canonical URL to also_found_in.
+        if len(dup.get("snippet", "") or "") > len(existing.get("snippet", "") or ""):
+            existing_url = existing.get("url", "")
+            existing["url"] = dup.get("url", existing_url)
+            existing["title"] = dup.get("title", existing.get("title", ""))
+            existing["snippet"] = dup.get("snippet", existing.get("snippet", ""))
+            alt = existing_url
+        else:
+            alt = dup.get("url", "")
+        if alt and alt != existing.get("url"):
+            existing.setdefault("also_found_in", []).append(alt)
+        # Best values across duplicates
+        for key in ("doi", "published_date", "title"):
+            new_val = dup.get(key)
+            if new_val and not existing.get(key):
+                existing[key] = new_val
+        if dup.get("citation_count") is not None:
+            old_cc = existing.get("citation_count") or 0
+            existing["citation_count"] = max(old_cc, dup["citation_count"])
+        if len(dup.get("authors", []) or []) > len(existing.get("authors", []) or []):
+            existing["authors"] = dup["authors"]
+        # Tier: keep the higher tier (P1 > P2 > P3 > UNV)
+        tier_rank = {"P1": 4, "P2": 3, "P3": 2, "UNV": 1}
+        if tier_rank.get(dup.get("tier", "UNV"), 1) > tier_rank.get(existing.get("tier", "UNV"), 1):
+            existing["tier"] = dup["tier"]
+        score_keys = ("adjusted_score", "score", "similarity")
+        for key in score_keys:
+            if dup.get(key) is not None:
+                existing[key] = max(existing.get(key) or 0, dup[key])
+
+    for s in sources:
+        doi = _normalize_doi(s.get("doi") or (s.get("extra", {}) or {}).get("doi"))
+        fp = _title_fingerprint(s.get("title"))
+
+        match_idx = None
+        if doi and doi in by_doi:
+            match_idx = by_doi[doi]
+        elif fp and fp in by_title:
+            match_idx = by_title[fp]
+
+        if match_idx is not None:
+            _merge(deduped[match_idx], s)
+        else:
+            if doi:
+                s["doi"] = doi  # persist normalized form
+                by_doi[doi] = len(deduped)
+            if fp:
+                by_title[fp] = len(deduped)
+            deduped.append(s)
+
+    removed = len(sources) - len(deduped)
+    if removed:
+        logger.info(f"Canonical dedup: {len(sources)} → {len(deduped)} sources ({removed} duplicates merged)")
+    return deduped
+
+
+def select_diverse_sources(
     sources: List[Dict],
-    decay_factor: float = 0.95,
-    current_year: Optional[int] = None,
+    max_sources: int = 25,
+    per_domain_cap: int = 3,
+    min_p2: int = 2,
 ) -> List[Dict]:
     """
-    Apply temporal decay to source scores.
+    Report-grade source selection: preserve BREADTH instead of hard-truncating
+    to 5 P1 sources (the old tier_enforce behavior that discarded ~90% of
+    gathered evidence).
 
-    A 2024 meta-analysis should outweigh a 2019 RCT on the same question.
-    Formula: score *= decay_factor ^ (current_year - source_year)
+    Selection strategy:
+    1. Rank all sources by adjusted_score (temporal decay already applied)
+    2. Walk the ranked list, capping per-domain representation (default 3)
+       so one prolific domain doesn't crowd out diverse perspectives
+    3. Guarantee at least `min_p2` P2 sources (industry/policy perspective)
+       and reserve slots so P3 counter-evidence survives when useful
+    4. Stop at max_sources
+
+    Args:
+        sources: Ranked source dicts
+        max_sources: Maximum sources to return (report context allows 20-30)
+        per_domain_cap: Max sources per base domain
+        min_p2: Minimum P2 sources to include when available
+
+    Returns:
+        Selected, diversity-balanced list of sources
+    """
+    if not sources:
+        return []
+
+    # Re-enforce tier from URL so selection sees accurate tiers
+    for s in sources:
+        s["tier"] = enforce_source_tier(s.get("url", ""), s.get("tier", "UNV"))
+
+    ranked = sorted(
+        sources,
+        key=lambda s: s.get("adjusted_score", s.get("score", s.get("similarity", 0.0)) or 0.0),
+        reverse=True,
+    )
+
+    selected: List[Dict] = []
+    domain_counts: Dict[str, int] = {}
+
+    def _base_domain(s: Dict) -> str:
+        return _extract_domain(s.get("url", "")) or "unknown"
+
+    # Pass 1: score-ordered walk with per-domain caps
+    deferred: List[Dict] = []
+    for s in ranked:
+        if len(selected) >= max_sources:
+            break
+        dom = _base_domain(s)
+        if domain_counts.get(dom, 0) >= per_domain_cap:
+            deferred.append(s)
+            continue
+        selected.append(s)
+        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+
+    # Pass 2: guarantee P2 representation (industry/policy perspective)
+    p2_count = sum(1 for s in selected if s.get("tier") == "P2")
+    if p2_count < min_p2:
+        for s in ranked:
+            if p2_count >= min_p2 or len(selected) >= max_sources:
+                break
+            if s.get("tier") != "P2" or s in selected:
+                continue
+            dom = _base_domain(s)
+            if domain_counts.get(dom, 0) >= per_domain_cap:
+                continue
+            selected.append(s)
+            domain_counts[dom] = domain_counts.get(dom, 0) + 1
+            p2_count += 1
+
+    # Pass 3: fill remaining slots from deferred (domain-capped) sources
+    for s in deferred:
+        if len(selected) >= max_sources:
+            break
+        if s in selected:
+            continue
+        dom = _base_domain(s)
+        if domain_counts.get(dom, 0) >= per_domain_cap:
+            continue
+        selected.append(s)
+        domain_counts[dom] = domain_counts.get(dom, 0) + 1
+
+    # Re-sort selected by score for context ordering
+    selected.sort(
+        key=lambda s: s.get("adjusted_score", s.get("score", s.get("similarity", 0.0)) or 0.0),
+        reverse=True,
+    )
+    logger.info(
+        f"Diverse source selection: {len(sources)} → {len(selected)} "
+        f"(P1={sum(1 for s in selected if s.get('tier')=='P1')}, "
+        f"P2={sum(1 for s in selected if s.get('tier')=='P2')}, "
+        f"domains={len(domain_counts)})"
+    )
+    return selected
+
+
+# ── Domain-aware temporal decay ──
+# A uniform 0.95/year factor is wrong across fields: an AI paper from 2022 is
+# often obsolete, while a 2015 clinical trial may still be the strongest
+# evidence. Fast-moving fields decay faster; fundamental science barely decays.
+# Override via env: APEX_TEMPORAL_DECAY_<DOMAIN> (e.g. APEX_TEMPORAL_DECAY_AI=0.7)
+DOMAIN_DECAY_FACTORS: Dict[str, float] = {
+    "ai": 0.85,          # ML/AI/NLP: fast-moving, SOTA churns quickly
+    "software": 0.88,    # software engineering / systems
+    "biotech": 0.90,     # genomics, biotech
+    "finance": 0.90,     # markets, monetary policy
+    "news": 0.80,        # news/current events decay fastest
+    "medicine": 0.97,    # clinical evidence is durable
+    "physics": 0.99,     # fundamental science
+    "mathematics": 0.995,
+}
+
+# Keyword hints used by infer_domain()
+_DOMAIN_KEYWORDS: Dict[str, re.Pattern] = {
+    "ai": re.compile(r'\b(llm|gpt|transformer|neural|machine learning|deep learning|ai\b|artificial intelligence|language model|diffusion|rlhf|embedding)\b', re.I),
+    "software": re.compile(r'\b(software|programming|compiler|database|distributed|cloud|api|kubernetes|microservice)\b', re.I),
+    "biotech": re.compile(r'\b(genom|crispr|protein|gene|biotech|sequenc|mrna)\b', re.I),
+    "finance": re.compile(r'\b(market|monetary|inflation|stock|fiscal|investment|economy|economic|central bank)\b', re.I),
+    "news": re.compile(r'\b(latest|breaking|announced|this week|this month|current|recent)\b', re.I),
+    "medicine": re.compile(r'\b(clinical|patient|therapy|treatment|drug|disease|cancer|vaccine|trial|diagnos|symptom)\b', re.I),
+    "physics": re.compile(r'\b(quantum|particle|relativity|cosmolog|photon|thermodynamic)\b', re.I),
+    "mathematics": re.compile(r'\b(theorem|proof|conjecture|lemma|topolog|algebraic|geometr)\b', re.I),
+}
+
+
+def infer_domain(query: str, classification: str = "") -> str:
+    """
+    Infer the research domain of a query for domain-aware decay and cache TTL.
+
+    Priority: explicit classification hint > keyword match > "general".
+    """
+    if classification in DOMAIN_DECAY_FACTORS:
+        return classification
+    q = query or ""
+    best_domain, best_hits = "general", 0
+    for domain, pattern in _DOMAIN_KEYWORDS.items():
+        hits = len(pattern.findall(q))
+        if hits > best_hits:
+            best_domain, best_hits = domain, hits
+    return best_domain
+
+
+def get_decay_factor(domain: str) -> float:
+    """Get the yearly temporal-decay factor for a domain (env-overridable)."""
+    default = 0.95
+    if not domain or domain == "general":
+        return float(os.getenv("APEX_TEMPORAL_DECAY_GENERAL", str(default)))
+    return float(os.getenv(f"APEX_TEMPORAL_DECAY_{domain.upper()}", str(DOMAIN_DECAY_FACTORS.get(domain, default))))
+
+
+def _extract_source_year(s: Dict) -> Optional[int]:
+    """
+    Extract publication year from a source, checking multiple metadata
+    locations. Fixes the old behavior where undated-looking arXiv sources
+    were penalized even when the year was present in metadata.
+    """
+    # 1. Explicit published_date ("2024-03-15" or "2024")
+    pub_date = s.get("published_date", "")
+    if pub_date and len(str(pub_date)) >= 4:
+        try:
+            year = int(str(pub_date)[:4])
+            if 1900 <= year <= 2100:
+                return year
+        except (ValueError, TypeError):
+            pass
+
+    # 2. metadata.year / metadata.published
+    meta = s.get("metadata", {}) or {}
+    for key in ("year", "published", "publication_year"):
+        val = meta.get(key)
+        if val:
+            try:
+                year = int(str(val)[:4])
+                if 1900 <= year <= 2100:
+                    return year
+            except (ValueError, TypeError):
+                pass
+
+    # 3. arXiv ID embedded in metadata or URL ("2403.12345" → 2024)
+    arxiv_id = (s.get("metadata", {}) or {}).get("arxiv_id") or s.get("arxiv_id", "")
+    if not arxiv_id:
+        url = s.get("url", "")
+        m = re.search(r'arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})', url)
+        if m:
+            arxiv_id = m.group(1)
+    if arxiv_id:
+        m = re.match(r'(\d{2})\d{2}\.', arxiv_id)
+        if m:
+            yy = int(m.group(1))
+            year = 2000 + yy if yy <= 79 else 1900 + yy
+            return year
+
+    # 4. Top-level "year" field
+    val = s.get("year")
+    if val:
+        try:
+            year = int(str(val)[:4])
+            if 1900 <= year <= 2100:
+                return year
+        except (ValueError, TypeError):
+            pass
+
+    return None
+
+
+def apply_temporal_decay(
+    sources: List[Dict],
+    decay_factor: Optional[float] = None,
+    current_year: Optional[int] = None,
+    domain: Optional[str] = None,
+) -> List[Dict]:
+    """
+    Apply domain-aware temporal decay to source scores.
+
+    A 2024 meta-analysis should outweigh a 2019 RCT on the same question —
+    but how much "age" matters depends on the field. AI papers decay ~15%/yr,
+    clinical evidence ~3%/yr, mathematics ~0.5%/yr.
+
+    Formula: score *= factor ^ (current_year - source_year)
 
     Args:
         sources: List of source dicts with 'published_date' and 'score'
-        decay_factor: Yearly decay (0.95 = 5% penalty per year of age)
+        decay_factor: Explicit yearly decay override (skips domain inference)
         current_year: Override current year for testing
+        domain: Domain hint ("ai", "medicine", ...). Inferred from source
+                content when omitted.
 
     Returns:
-        Sources with adjusted scores
+        Sources with adjusted scores (re-sorted by adjusted_score desc)
     """
     year = current_year or datetime.now().year
 
     for s in sources:
-        pub_date = s.get("published_date", "")
-        source_year = None
+        source_year = _extract_source_year(s)
 
-        if pub_date and len(pub_date) >= 4:
-            try:
-                source_year = int(pub_date[:4])
-            except (ValueError, TypeError):
-                pass
-
-        if source_year and source_year > 1900:
+        if source_year:
             age = max(0, year - source_year)
-            decay = decay_factor ** age
+            factor = decay_factor if decay_factor is not None else (
+                get_decay_factor(domain) if domain else get_decay_factor(infer_domain(
+                    f"{s.get('title', '')} {s.get('snippet', '')[:200]}"
+                ))
+            )
+            decay = factor ** age
             score = s.get("score", s.get("similarity", 1.0))
             s["adjusted_score"] = score * decay
         else:
-            # No date — slight penalty for undated sources
+            # No date found anywhere — slight penalty for undated sources
             score = s.get("score", s.get("similarity", 1.0))
             s["adjusted_score"] = score * 0.9
 
@@ -524,6 +861,7 @@ async def parallel_research(
     query: str,
     classification: str = "academic",
     max_results_per_source: int = 3,
+    max_sources: int = 12,
 ) -> ParallelResearchResult:
     """
     Execute parallel research across all sources with graceful failure handling.
@@ -532,12 +870,14 @@ async def parallel_research(
     - All sources queried simultaneously (no sequential blocking)
     - Individual failures don't crash the pipeline
     - Failed sources tracked and reported
-    - Minimum viable response even if most sources fail
+    - Canonical dedup (DOI/title) + diverse selection preserving breadth
 
     Args:
         query: Research query
         classification: Query type for routing
         max_results_per_source: Max results per source
+        max_sources: Final source budget after dedup/diversity selection
+            (chat callers keep the default; report callers pass 25+)
 
     Returns:
         ParallelResearchResult with successful/failed tracking
@@ -594,11 +934,16 @@ async def parallel_research(
             # Empty results — not a failure, just no matches
             successful_sources.append(name)
 
-    # Apply tier enforcement
-    all_results = tier_enforce(all_results) if all_results else []
+    # Canonical dedup: merge the same paper returned by multiple APIs
+    # (arXiv + Semantic Scholar + OpenAlex would otherwise waste context
+    # slots and fake "independent corroboration" during verification)
+    all_results = dedup_sources_canonical(all_results) if all_results else []
 
-    # Apply temporal decay
-    all_results = apply_temporal_decay(all_results)
+    # Diverse selection (NOT the old tier_enforce hard-truncation to 5)
+    all_results = select_diverse_sources(all_results, max_sources=max_sources) if all_results else []
+
+    # Domain-aware temporal decay
+    all_results = apply_temporal_decay(all_results, domain=infer_domain(query, classification))
 
     latency_ms = int((time.time() - start) * 1000)
 
@@ -769,6 +1114,481 @@ class ResearchReport:
     wiki_slug: str = ""
     wiki_version: int = 0
     from_cache: bool = False
+    # ── APEX 3.0 report-quality fields ──
+    evidence: Dict = field(default_factory=dict)          # full-text evidence stats
+    citation_metrics: Dict = field(default_factory=dict)  # citation integrity metrics
+    expanded_queries: List[str] = field(default_factory=list)
+    generation_mode: str = "sectionwise"                  # "sectionwise" | "single_call"
+    model_used: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════
+# APEX 3.0: SECTION-WISE REPORT GENERATION
+# One call per section beats one mega-call: no truncation, targeted
+# evidence per section, parallel drafting, measurable citation integrity.
+# ═══════════════════════════════════════════════════════════════
+
+SECTION_DRAFT_SYSTEM_PROMPT = """You are APEX Research, an expert research analyst drafting ONE section of a larger evidence-based report.
+
+CITATION FORMAT (NON-NEGOTIABLE):
+- Cite sources as [S1], [S2], ... matching the numbered source list provided.
+- ONLY cite sources that appear in the provided list. Never invent [S15] if 10 sources are given.
+- Every factual claim (numbers, findings, comparisons) MUST end with a citation.
+- If a claim has no supporting source, either omit it or mark it [UNVERIFIED].
+- When sources conflict, present BOTH sides with their citations.
+
+STYLE:
+- Substantial prose (not bare bullets) with tables where comparisons arise.
+- No preamble, no "In conclusion", no filler transitions.
+- Write ONLY the requested section — no other sections, no report title.
+- Use ## for the section heading exactly as given."""
+
+
+CRITIQUE_SYSTEM_PROMPT = """You are a hostile peer reviewer for a research report.
+
+Given the report and its numbered source list, identify ONLY these defect types:
+1. HALLUCINATED_CITATION: a [Sn] citation whose claim is NOT actually supported by that source
+2. MISSING_CITATION: a factual claim sentence with no citation
+3. UNSUPPORTED_SUPERLATIVE: sweeping claims ("most", "best", "proves") without evidence
+4. STALE_EVIDENCE: claims resting on clearly outdated sources when newer ones exist
+
+Return ONLY valid JSON:
+{"issues": [{"section_heading": "...", "type": "...", "detail": "...", "fix": "specific instruction"}]}
+If the report is clean, return {"issues": []}. Max 6 issues — the worst ones only."""
+
+
+DEFAULT_QUICK_SECTIONS = [
+    {"id": "exec_summary", "title": "EXECUTIVE SUMMARY", "purpose": "Key findings, confidence level, why it matters", "key_questions": ["What are the most important established findings?", "What is the overall confidence?"]},
+    {"id": "key_findings", "title": "KEY FINDINGS", "purpose": "Detailed findings with evidence and epistemic status", "key_questions": ["What did the strongest sources find?", "Which findings are established vs tentative?"]},
+    {"id": "analysis", "title": "ANALYSIS & LIMITATIONS", "purpose": "Trade-offs, evidence quality, methodology caveats", "key_questions": ["What are the limitations of the evidence?", "What practical implications follow?"]},
+]
+
+DEFAULT_THOROUGH_SECTIONS = [
+    {"id": "exec_summary", "title": "EXECUTIVE SUMMARY", "purpose": "Key findings, overall confidence, critical gaps, why it matters", "key_questions": ["What are the most important established findings?", "What remains uncertain or contested?", "Why does this topic matter now?"]},
+    {"id": "key_findings", "title": "KEY FINDINGS", "purpose": "8-15 detailed findings with evidence table and epistemic status", "key_questions": ["What did the strongest P1/P2 sources find?", "Which findings are ESTABLISHED vs TENTATIVE?", "What numbers/effect sizes are reported?"]},
+    {"id": "comparative", "title": "COMPARATIVE ANALYSIS", "purpose": "Multi-dimension comparison table of approaches/methods/options with trade-off analysis", "key_questions": ["What are the main approaches/options?", "How do they differ across key dimensions?", "When is each optimal?"]},
+    {"id": "evidence_quality", "title": "EVIDENCE QUALITY MATRIX", "purpose": "Table of evidence types, counts, confidence, key limitations", "key_questions": ["What study types back the findings?", "Where is the evidence weak or missing?"]},
+    {"id": "debates", "title": "ACTIVE DEBATES", "purpose": "Points where sources conflict — both sides with citations", "key_questions": ["Where do sources disagree?", "Which side has stronger evidence?"]},
+    {"id": "speculative", "title": "SPECULATIVE FINDINGS", "purpose": "Early inferences needing replication, with confirmation criteria", "key_questions": ["What looks promising but is unproven?", "What evidence would confirm or falsify it?"]},
+    {"id": "methodology", "title": "METHODOLOGY NOTES", "purpose": "Sample sizes, study designs, biases, geographic/temporal limits", "key_questions": ["What are the methodology caveats?", "What biases might skew the evidence?"]},
+    {"id": "implications", "title": "PRACTICAL IMPLICATIONS & RECOMMENDATIONS", "purpose": "Actionable recommendations with confidence and risks, plus future research directions", "key_questions": ["What should the reader do?", "What questions remain open?"]},
+]
+
+
+async def expand_query_variants(query: str, max_variants: int = 3) -> List[str]:
+    """
+    HyDE-style query expansion: generate paraphrase/perspective variants so
+    the parallel research pass retrieves beyond the exact query wording.
+
+    Falls back to [query] on any failure — expansion is an enhancement,
+    never a blocker.
+    """
+    from agent.llm_router import synthesize_with_router
+
+    prompt = f"""Generate {max_variants - 1} alternative research queries for the same information need, each emphasizing a different angle (technical, empirical, practical/state-of-the-art).
+
+Original query: {query}
+
+Return ONLY numbered queries, one per line, nothing else."""
+
+    try:
+        result = await synthesize_with_router(
+            query="expand research query",
+            context=prompt,
+            max_tokens=120,
+            system_prompt="You rewrite research queries for better retrieval coverage. Return only numbered items.",
+            task_type="classification",  # tiny output, cheap models fine
+        )
+        variants = [query]
+        for line in result.content.split("\n"):
+            m = re.match(r'^\d+[\.\)]\s*(.+)', line.strip())
+            if m and len(m.group(1).strip()) > 10:
+                variants.append(m.group(1).strip())
+        return variants[:max_variants]
+    except Exception as e:
+        logger.debug(f"Query expansion failed (non-fatal): {e}")
+        return [query]
+
+
+async def _rag_sources_for_report(query: str, max_context_tokens: int = 8000) -> List[Dict]:
+    """
+    Hybrid report mode: pull RAG corpus results alongside live search.
+    Reports want max recall — never depend on the RAG-vs-live binary decision.
+
+    Converts RetrievedChunks to source dicts and returns [] on any failure
+    (DB-less mode must keep working).
+    """
+    try:
+        from agent.retriever import retrieve
+        chunks, avg_sim = await retrieve(
+            query,
+            top_k=12,
+            final_k=8,
+            max_context_tokens=max_context_tokens,
+        )
+        rag_sources = []
+        for c in chunks:
+            rag_sources.append({
+                "url": c.source_url,
+                "title": c.title or "",
+                "snippet": c.raw_text,
+                "tier": c.source_tier,
+                "domain": c.domain,
+                "authors": c.authors or [],
+                "published_date": (c.metadata or {}).get("published_date", ""),
+                "doi": (c.metadata or {}).get("doi") or (c.metadata or {}).get("arxiv_id", ""),
+                "score": c.similarity_score,
+                "origin": "rag",
+            })
+        logger.info(f"Hybrid RAG merge: {len(rag_sources)} corpus chunks added to report sources")
+        return rag_sources
+    except Exception as e:
+        logger.debug(f"RAG retrieval for report failed (non-fatal): {e}")
+        return []
+
+
+async def _snowball_sources(sources: List[Dict], max_seeds: int = 2, per_seed: int = 4) -> List[Dict]:
+    """
+    Citation snowballing: expand the top Semantic Scholar hits via their
+    forward citations (newer work building on them). Pure addition — the
+    caller re-dedups, so overlap with existing sources is harmless.
+    """
+    seeds = []
+    for s in sources:
+        paper_id = (s.get("extra", {}) or {}).get("paperId") or ""
+        if not paper_id:
+            m = re.search(r'semanticscholar\.org/paper/([A-Za-z0-9]{20,})', s.get("url", ""))
+            if m:
+                paper_id = m.group(1)
+        if paper_id:
+            seeds.append(paper_id)
+        if len(seeds) >= max_seeds:
+            break
+    if not seeds:
+        return []
+
+    try:
+        from tools.search_sources import snowball_semantic_scholar
+        tasks = [snowball_semantic_scholar(pid, direction="citations", max_results=per_seed) for pid in seeds]
+        batches = await asyncio.gather(*tasks, return_exceptions=True)
+        snowballed = []
+        for batch in batches:
+            if isinstance(batch, Exception):
+                continue
+            for r in batch:
+                snowballed.append({
+                    "url": r.url,
+                    "title": r.title,
+                    "snippet": r.snippet,
+                    "tier": r.source_tier,
+                    "source_name": r.source_name,
+                    "published_date": r.published_date,
+                    "authors": r.authors,
+                    "citation_count": r.citation_count,
+                    "doi": r.doi,
+                    "extra": r.extra,
+                    "origin": "snowball",
+                })
+        if snowballed:
+            logger.info(f"Snowballing added {len(snowballed)} candidate papers")
+        return snowballed
+    except Exception as e:
+        logger.debug(f"Snowballing failed (non-fatal): {e}")
+        return []
+
+
+async def _generate_outline(
+    query: str,
+    sources: List[Dict],
+    verification: Optional[VerificationResult],
+    depth: str,
+) -> List[Dict]:
+    """
+    Outline-first planning: an LLM proposes the report's sections given the
+    evidence inventory (claims with epistemic status + source titles).
+
+    Falls back to the built-in default section plan on any failure.
+    """
+    from agent.llm_router import synthesize_with_router
+
+    defaults = DEFAULT_THOROUGH_SECTIONS if depth == "thorough" else DEFAULT_QUICK_SECTIONS
+
+    claims_blob = ""
+    if verification and verification.claims:
+        lines = []
+        for c in verification.claims[:12]:
+            lines.append(f"- [{c.epistemic_status}] {c.statement[:140]}")
+        claims_blob = "\n".join(lines)
+
+    sources_blob = "\n".join(
+        f"[S{i}] [{s.get('tier', 'UNV')}] {(s.get('title') or 'Untitled')[:90]}"
+        for i, s in enumerate(sources[:20], 1)
+    )
+
+    prompt = f"""Plan the section structure for a research report on:
+QUERY: {query}
+
+AVAILABLE SOURCES:
+{sources_blob}
+
+VERIFIED CLAIMS SO FAR:
+{claims_blob or "(none extracted yet)"}
+
+Choose 4-{len(DEFAULT_THOROUGH_SECTIONS)} sections. You may adapt the standard structure
+(Executive Summary, Key Findings, Comparative Analysis, Evidence Quality, Active Debates, Speculative Findings, Methodology Notes, Practical Implications) to fit the evidence — drop sections with no evidence, add a section if the evidence demands it.
+
+Return ONLY valid JSON:
+{{"sections": [{{"id": "kebab-id", "title": "SECTION TITLE", "purpose": "1 sentence", "key_questions": ["q1", "q2"]}}]}}"""
+
+    try:
+        result = await synthesize_with_router(
+            query="plan report outline",
+            context=prompt,
+            max_tokens=900,
+            system_prompt="You plan evidence-based research reports. Return ONLY valid JSON.",
+            task_type="outline",
+        )
+        content = result.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        m = re.search(r'\{[\s\S]*\}', content)
+        if m:
+            data = json.loads(m.group())
+            sections = data.get("sections", [])
+            # Validate: need id/title/purpose; cap at 9 sections
+            valid = []
+            for s in sections[:9]:
+                if isinstance(s, dict) and s.get("title"):
+                    valid.append({
+                        "id": str(s.get("id", s["title"].lower().replace(" ", "-")))[:40],
+                        "title": str(s["title"]).upper()[:80],
+                        "purpose": str(s.get("purpose", ""))[:300],
+                        "key_questions": [str(q)[:200] for q in (s.get("key_questions") or [])][:4],
+                    })
+            if len(valid) >= 3:
+                logger.info(f"Outline generated: {len(valid)} sections via {result.model_name}")
+                return valid
+    except Exception as e:
+        logger.debug(f"Outline generation failed, using default structure: {e}")
+
+    return [dict(s) for s in defaults]
+
+
+def _claims_for_section(section: Dict, verification: Optional[VerificationResult], max_claims: int = 8) -> str:
+    """Pick verified claims relevant to a section (keyword overlap) for its context."""
+    if not verification or not verification.claims:
+        return ""
+    section_text = f"{section.get('title', '')} {section.get('purpose', '')} {' '.join(section.get('key_questions', []))}".lower()
+    sec_terms = set(re.findall(r'\b\w{4,}\b', section_text))
+
+    scored = []
+    for c in verification.claims:
+        claim_terms = set(re.findall(r'\b\w{4,}\b', c.statement.lower()))
+        overlap = len(sec_terms & claim_terms)
+        if overlap >= 2:
+            scored.append((overlap, c))
+    scored.sort(key=lambda t: t[0], reverse=True)
+
+    lines = []
+    for _, c in scored[:max_claims]:
+        conflicts = f" ({len(c.conflicting_sources)} sources CONFLICT)" if c.conflicting_sources else ""
+        lines.append(f"- [{c.epistemic_status}] (conf={c.confidence}, {c.evidence_type or 'n/a'}) {c.statement[:250]}{conflicts}")
+    return "\n".join(lines)
+
+
+async def _draft_section(
+    section: Dict,
+    query: str,
+    sources: List[Dict],
+    corpus,   # EvidenceCorpus
+    verification: Optional[VerificationResult],
+    depth: str,
+) -> tuple:
+    """
+    Draft ONE report section with targeted evidence retrieval.
+
+    Returns (section_id, markdown, model_used). Never raises — on total
+    failure returns a minimal placeholder so assembly always produces a
+    complete report skeleton.
+    """
+    from agent.llm_router import synthesize_with_router
+    from agent.evidence_fetcher import retrieve_evidence, format_evidence_for_context
+
+    section_query = f"{section.get('title', '')}. {section.get('purpose', '')}. " + " ".join(section.get("key_questions", []))
+
+    # Targeted evidence for THIS section
+    evidence_text = ""
+    try:
+        if corpus and len(corpus) > 0:
+            ev_chunks = await retrieve_evidence(corpus, section_query, k=6)
+            evidence_text = format_evidence_for_context(ev_chunks)
+    except Exception as e:
+        logger.debug(f"Evidence retrieval failed for section {section.get('id')}: {e}")
+
+    # Source inventory (numbered, so the model can cite [S1]..[Sn])
+    sources_blob = "\n".join(
+        f"[S{i}] [{s.get('tier', 'UNV')}] {(s.get('title') or 'Untitled')[:100]}: {(s.get('snippet') or '')[:400]}"
+        for i, s in enumerate(sources, 1)
+    )
+
+    claims_blob = _claims_for_section(section, verification)
+
+    word_target = "250-500" if depth == "quick" else "400-800"
+    user_prompt = f"""REPORT QUERY: {query}
+
+YOUR SECTION: {section.get('title', '')}
+PURPOSE: {section.get('purpose', '')}
+KEY QUESTIONS TO ANSWER:
+""" + "\n".join(f"- {q}" for q in section.get("key_questions", [])) + f"""
+
+FULL-TIME EVIDENCE (retrieved passages with [S{{n}}|TIER] attribution — prefer these over snippets):
+{evidence_text or "(no full-text evidence available for this section — rely on the source snippets below)"}
+
+VERIFIED CLAIMS (use these epistemic labels verbatim):
+{claims_blob or "(none)"}
+
+NUMBERED SOURCE INVENTORY:
+{sources_blob}
+
+Write the section now. Target {word_target} words. Head it with: ## {section.get('title', '')}
+Cite with [S{{n}}] tags ONLY from the inventory above."""
+
+    try:
+        result = await synthesize_with_router(
+            query=section_query[:200],
+            context=user_prompt,
+            max_tokens=2048 if depth == "quick" else 3072,
+            system_prompt=SECTION_DRAFT_SYSTEM_PROMPT,
+            task_type="report",
+        )
+        content = result.content.strip()
+        if content.startswith("[ALL_LLM_FAILED]") or len(content) < 80:
+            return section.get("id", "section"), "", result.model_name
+        return section.get("id", "section"), content, result.model_name
+    except Exception as e:
+        logger.warning(f"Section drafting failed for {section.get('id')}: {e}")
+        return section.get("id", "section"), "", ""
+
+
+def _assemble_report(section_markdowns: List[str], sources: List[Dict]) -> str:
+    """
+    Assemble section drafts into a full report.
+    The SOURCES bibliography is built PROGRAMMATICALLY (deterministic —
+    the LLM never gets to invent the source list).
+    """
+    from agent.citation_integrity import build_sources_section
+
+    body = "\n\n".join(md.strip() for md in section_markdowns if md and md.strip())
+    return f"{body}\n\n{build_sources_section(sources)}"
+
+
+async def _critique_and_revise(
+    report_text: str,
+    query: str,
+    sources: List[Dict],
+    depth: str,
+) -> tuple:
+    """
+    Critique pass: mechanical citation-integrity check + hostile-reviewer LLM
+    pass. If real issues surface, ONE revision call regenerates the report
+    with the issue list as feedback.
+
+    Returns (final_text, critique_summary_dict, model_used).
+    """
+    from agent.llm_router import synthesize_with_router
+    from agent.citation_integrity import check_report_citations
+
+    citation_report = check_report_citations(report_text, sources)
+    critique_summary = {
+        "citation_precision": citation_report.citation_precision,
+        "claim_coverage": citation_report.claim_coverage,
+        "invalid_citations": citation_report.invalid_citations,
+        "uncited_claims": len(report_text and citation_report.uncited_claim_sentences or []),
+        "llm_issues": 0,
+        "revised": False,
+    }
+
+    # LLM critique (skip when the mechanical pass already failed badly —
+    # the revision prompt will carry both mechanical and LLM issues)
+    llm_issues = []
+    try:
+        sources_blob = "\n".join(
+            f"[S{i}] {(s.get('title') or 'Untitled')[:100]}: {(s.get('snippet') or '')[:300]}"
+            for i, s in enumerate(sources, 1)
+        )
+        critique_prompt = f"""REPORT TO REVIEW (may be truncated):
+{report_text[:14000]}
+
+SOURCE LIST:
+{sources_blob}
+
+Find the worst hallucinated citations, missing citations, and unsupported superlatives. Return ONLY the JSON."""
+        result = await synthesize_with_router(
+            query="critique report",
+            context=critique_prompt,
+            max_tokens=700,
+            system_prompt=CRITIQUE_SYSTEM_PROMPT,
+            task_type="nli",
+        )
+        content = result.content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        m = re.search(r'\{[\s\S]*\}', content)
+        if m:
+            data = json.loads(m.group())
+            llm_issues = [i for i in data.get("issues", []) if isinstance(i, dict) and i.get("fix")][:6]
+    except Exception as e:
+        logger.debug(f"LLM critique failed (non-fatal): {e}")
+
+    critique_summary["llm_issues"] = len(llm_issues)
+    all_issues = list(citation_report.issues) + [f"[{i.get('type')}] {i.get('detail')} → {i.get('fix')}" for i in llm_issues]
+
+    if not all_issues:
+        return report_text, critique_summary, ""
+
+    # One revision pass with all issues as feedback
+    issues_blob = "\n".join(f"{n+1}. {issue}" for n, issue in enumerate(all_issues[:10]))
+    sources_blob = "\n".join(
+        f"[S{i}] [{s.get('tier', 'UNV')}] {(s.get('title') or 'Untitled')[:100]}: {(s.get('snippet') or '')[:350]}"
+        for i, s in enumerate(sources, 1)
+    )
+    revise_prompt = f"""Fix the defects flagged by review in this research report. Change ONLY what the issues require — keep everything else verbatim.
+
+QUERY: {query}
+
+FLAGGED ISSUES:
+{issues_blob}
+
+NUMBERED SOURCE INVENTORY (only [S1]..[S{len(sources)}] exist):
+{sources_blob}
+
+REPORT:
+{report_text[:14000]}
+
+Return the FULL corrected report (same structure, ## sections, [Sn] citations, SOURCES section at the end)."""
+
+    try:
+        result = await synthesize_with_router(
+            query="revise report",
+            context=revise_prompt,
+            max_tokens=8192,
+            system_prompt=SECTION_DRAFT_SYSTEM_PROMPT,
+            task_type="report",
+        )
+        content = result.content.strip()
+        if not content.startswith("[ALL_LLM_FAILED]") and len(content) > len(report_text) * 0.5:
+            critique_summary["revised"] = True
+            # Re-check citations after revision
+            post = check_report_citations(content, sources)
+            critique_summary["citation_precision"] = post.citation_precision
+            critique_summary["claim_coverage"] = post.claim_coverage
+            return content, critique_summary, result.model_name
+    except Exception as e:
+        logger.debug(f"Revision pass failed (non-fatal): {e}")
+
+    return report_text, critique_summary, ""
 
 
 async def generate_research_report(
@@ -778,27 +1598,34 @@ async def generate_research_report(
     max_cycles: int = 3,
     user_id: Optional[str] = None,
     apex_tier: str = "apex-free",
+    use_nli: Optional[bool] = None,
 ) -> ResearchReport:
     """
-    Generate a structured research report with verification.
+    APEX 3.0 report pipeline:
 
-    APEX 2.0 pipeline: Research → Verify → Compile → Wiki → Cache
-    Every query compounds. Every claim is traceable.
+        cache check → query expansion → HYBRID research (live ⊕ RAG ⊕ snowball)
+        → canonical dedup → diverse selection → full-text EVIDENCE corpus
+        → claim extraction + NLI verification → OUTLINE → parallel section
+        drafting → assembly (deterministic bibliography) → critique/revise
+        → wiki compile + cache
 
     Args:
         query: Research query
         classification: Query type for routing
-        depth: "quick" (1 cycle) or "thorough" (up to max_cycles)
+        depth: "quick" (4 sections) or "thorough" (up to 8 sections + iterative loop)
         max_cycles: Max research cycles for thorough mode
         user_id: Optional user ID for cache association
         apex_tier: apex-free or apex-premium
+        use_nli: Force NLI verification on/off. Default: env APEX_USE_NLI (true)
 
     Returns:
         ResearchReport with structured findings + wiki/cache metadata
     """
     start = time.time()
+    if use_nli is None:
+        use_nli = os.getenv("APEX_USE_NLI", "true").lower() in ("1", "true", "yes")
 
-    # ── APEX 2.0 Step 0: Check LLM Wiki cache ──
+    # ── Step 0: Check LLM Wiki cache (read-side TTL enforced in check_cache) ──
     from agent.llm_wiki import get_wiki_engine
     wiki_engine = get_wiki_engine()
 
@@ -815,35 +1642,153 @@ async def generate_research_report(
         report.from_cache = True
         return report
 
-    # Step 1: Parallel research
-    research = await parallel_research(query, classification)
+    # ── Step 1: Query expansion (HyDE-style variants) ──
+    variants = await expand_query_variants(query, max_variants=3 if depth == "thorough" else 2)
+    logger.info(f"Query expanded into {len(variants)} variants")
 
-    # Step 2: Iterative research (if thorough mode)
+    # ── Step 2: HYBRID research — live search per variant ⊕ RAG corpus, concurrent ──
+    live_tasks = [
+        parallel_research(
+            v,
+            classification,
+            max_results_per_source=3,
+            max_sources=25 if depth == "thorough" else 15,
+        )
+        for v in variants
+    ]
+    rag_task = _rag_sources_for_report(query)
+
+    live_results = await asyncio.gather(*live_tasks, return_exceptions=True)
+    rag_sources = await rag_task
+
+    all_sources: List[Dict] = list(rag_sources)
+    successful: List[str] = []
+    failed: List[str] = []
+    for res in live_results:
+        if isinstance(res, ParallelResearchResult):
+            all_sources.extend(res.results)
+            successful.extend(res.successful_sources)
+            failed.extend(res.failed_sources)
+
+    # ── Step 3: Canonical dedup → diverse selection → domain-aware decay ──
+    all_sources = dedup_sources_canonical(all_sources)
+    all_sources = select_diverse_sources(all_sources, max_sources=28 if depth == "thorough" else 18)
+
+    # ── Step 4: Snowball top academic seeds (thorough mode adds the most) ──
+    if depth == "thorough":
+        snowballed = await _snowball_sources(all_sources)
+        if snowballed:
+            merged = dedup_sources_canonical(all_sources + snowballed)
+            all_sources = select_diverse_sources(merged, max_sources=30)
+
+    # ── Step 5: Iterative gap-filling (thorough, verification-driven) ──
     if depth == "thorough" and max_cycles > 1:
-        research = await _iterative_research(query, research, max_cycles)
+        claims_pre = _extract_claims_from_sources(all_sources)
+        verification_pre = verify_claims_from_sources(claims_pre, all_sources)
+        enriched = await _iterative_research(
+            query,
+            ParallelResearchResult(results=all_sources),
+            max_cycles,
+            verification=verification_pre,
+        )
+        if len(enriched.results) > len(all_sources):
+            all_sources = select_diverse_sources(
+                dedup_sources_canonical(enriched.results),
+                max_sources=30,
+            )
 
-    # Step 3: Extract and verify claims
-    claims = _extract_claims_from_sources(research.results)
-    verification = verify_claims_from_sources(claims, research.results)
+    if not all_sources:
+        # Absolute fallback: single-call generation on empty evidence
+        raw_report = f"# Research Report\n\n## EXECUTIVE SUMMARY\n\nNo sources could be retrieved for this query. Try again or broaden the query.\n"
+        report = _parse_report(raw_report)
+        report.query = query
+        report.depth = depth
+        report.total_latency_ms = int((time.time() - start) * 1000)
+        report.sources = []
+        report.generation_mode = "single_call"
+        return report
 
-    # Step 4: Generate structured report via LLM
-    raw_report = await _generate_report_text(query, research.results, verification, depth)
+    # ── Step 6: FULL-TEXT EVIDENCE CORPUS (the quality lever) ──
+    try:
+        from agent.evidence_fetcher import build_evidence_corpus, evidence_stats
+        corpus = await build_evidence_corpus(all_sources, top_n=6 if depth == "quick" else 8)
+        ev_stats = evidence_stats(corpus)
+    except Exception as e:
+        logger.warning(f"Evidence corpus build failed (non-fatal): {e}")
+        from agent.evidence_fetcher import EvidenceCorpus
+        corpus = EvidenceCorpus()
+        ev_stats = {"chunks": 0, "fetched_sources": 0, "failed_sources": 0, "total_chars": 0, "semantic_scoring": False}
 
-    # Step 5: Parse into structured format
+    # ── Step 7: Claim extraction + verification (heuristic prefilter ⊕ NLI) ──
+    claims = _extract_claims_from_sources(all_sources)
+    verification = verify_claims_from_sources(claims, all_sources)
+
+    if use_nli and claims:
+        try:
+            from agent.verifier import verify_claims_with_nli
+            nli_results = await verify_claims_with_nli(claims, all_sources)
+            verification = _merge_nli_into_verification(verification, nli_results)
+        except Exception as e:
+            logger.warning(f"NLI verification failed, keeping heuristic statuses (non-fatal): {e}")
+
+    # ── Step 8: OUTLINE ──
+    outline = await _generate_outline(query, all_sources, verification, depth)
+    logger.info(f"Report outline: {[s['title'] for s in outline]}")
+
+    # ── Step 9: PARALLEL SECTION DRAFTING ──
+    draft_tasks = [
+        _draft_section(section, query, all_sources, corpus, verification, depth)
+        for section in outline
+    ]
+    draft_results = await asyncio.gather(*draft_tasks, return_exceptions=True)
+
+    sections_md: List[str] = []
+    models_used: List[str] = []
+    for section, result in zip(outline, draft_results):
+        if isinstance(result, Exception) or not isinstance(result, tuple):
+            logger.warning(f"Section {section.get('id')} failed entirely: {result}")
+            continue
+        _sid, md, model_used = result
+        if md:
+            sections_md.append(md)
+            if model_used:
+                models_used.append(model_used)
+
+    generation_mode = "sectionwise"
+
+    # Fallback: every section draft failed → legacy single-call path
+    if not sections_md:
+        logger.warning("All section drafts failed — falling back to single-call generation")
+        raw_report = await _generate_report_text(query, all_sources, verification, depth)
+        generation_mode = "single_call"
+    else:
+        raw_report = _assemble_report(sections_md, all_sources)
+
+    # ── Step 10: CRITIQUE + REVISE (citation integrity loop) ──
+    raw_report, critique, revise_model = await _critique_and_revise(raw_report, query, all_sources, depth)
+    if revise_model:
+        models_used.append(revise_model)
+
+    # ── Step 11: Parse + finalize ──
     report = _parse_report(raw_report)
     report.query = query
     report.verification = verification
     report.total_latency_ms = int((time.time() - start) * 1000)
     report.depth = depth
-    report.sources = research.results
+    report.sources = all_sources
     report.from_cache = False
+    report.evidence = ev_stats
+    report.citation_metrics = critique
+    report.expanded_queries = variants
+    report.generation_mode = generation_mode
+    report.model_used = models_used[-1] if models_used else ""
 
-    # ── APEX 2.0 Step 6: Compile into Wiki + Cache ──
+    # ── APEX 2.0 Step 12: Compile into Wiki + Cache ──
     try:
         wiki_page, cache_id = await wiki_engine.research_to_wiki(
             query=query,
             report=raw_report,
-            sources=research.results,
+            sources=all_sources,
             verification=verification,
             mode=depth,
             apex_tier=apex_tier,
@@ -868,6 +1813,61 @@ async def generate_research_report(
         report.wiki_cache_id = None
 
     return report
+
+
+def _merge_nli_into_verification(
+    verification: VerificationResult,
+    nli_results: Dict[str, Dict],
+) -> VerificationResult:
+    """
+    Overlay NLI verdicts onto the heuristic verification result.
+    Claims with NLI data get NLI statuses/confidence; others keep heuristic
+    values. Recomputes the summary counters.
+    """
+    if not nli_results:
+        return verification
+
+    for claim in verification.claims:
+        nli = nli_results.get(claim.statement)
+        if not nli:
+            continue
+        claim.epistemic_status = nli["status"]
+        claim.confidence = nli["confidence"]
+        if nli.get("evidence_type"):
+            claim.evidence_type = nli["evidence_type"]
+        # Attach NLI quotes as structured supporting/conflicting entries
+        nli_supports = [
+            {"url": s.get("source_url", ""), "title": "", "tier": s.get("source_tier", "UNV"),
+             "quote": s.get("quote", ""), "supports": True, "conflicts": False}
+            for s in nli.get("supports", [])
+        ]
+        nli_conflicts = [
+            {"url": s.get("source_url", ""), "title": "", "tier": s.get("source_tier", "UNV"),
+             "quote": s.get("quote", ""), "supports": False, "conflicts": True}
+            for s in nli.get("contradictions", [])
+        ]
+        if nli_supports:
+            claim.supporting_sources = nli_supports[:5]
+        if nli_conflicts:
+            claim.conflicting_sources = nli_conflicts[:5]
+
+    # Recompute summary counters
+    verification.established_count = sum(1 for c in verification.claims if c.epistemic_status == EPISTEMIC_ESTABLISHED)
+    verification.tentative_count = sum(1 for c in verification.claims if c.epistemic_status == EPISTEMIC_TENTATIVE)
+    verification.contested_count = sum(1 for c in verification.claims if c.epistemic_status == EPISTEMIC_CONTESTED)
+    verification.unverifiable_count = sum(1 for c in verification.claims if c.epistemic_status == EPISTEMIC_UNVERIFIED)
+
+    if verification.claims:
+        statuses = [c.epistemic_status for c in verification.claims]
+        verification.summary = (
+            f"{verification.established_count} established, "
+            f"{verification.tentative_count} tentative, "
+            f"{verification.contested_count} contested, "
+            f"{verification.unverifiable_count} unverified "
+            f"(NLI-verified: {len(nli_results)}/{len(verification.claims)})"
+        )
+
+    return verification
 
 
 def _extract_claims_from_sources(sources: List[Dict]) -> List[str]:
@@ -908,7 +1908,12 @@ async def _generate_report_text(
     verification: VerificationResult,
     depth: str = "quick",
 ) -> str:
-    """Generate the structured report text via LLM."""
+    """Generate the structured report text via LLM (fallback single-call path).
+
+    Routes with task_type="report" so mid/capable models (4k-8k output caps)
+    handle it — the old code routed through the full chain starting at the
+    150-token cheap models, silently truncating reports to ~110 words.
+    """
     from agent.llm_router import synthesize_with_router
 
     # Select prompt based on depth
@@ -944,10 +1949,11 @@ async def _generate_report_text(
     router_result = await synthesize_with_router(
         query=query,
         context=context,
-        max_tokens=max_tokens,  # 2048 quick / 4096 thorough (was 500)
-        similarity=0.3,  # Route to strongest models (was 0.5)
+        max_tokens=max_tokens,  # 2048 quick / 4096 thorough
+        similarity=0.3,  # Route to strongest models
         table_needed=True,
         system_prompt=system_prompt,
+        task_type="report",  # mid/capable models ONLY — never 150-token cheap tiers
     )
 
     return router_result.content
@@ -1016,17 +2022,23 @@ async def _iterative_research(
     query: str,
     initial_research: ParallelResearchResult,
     max_cycles: int = 3,
+    verification: Optional[VerificationResult] = None,
 ) -> ParallelResearchResult:
     """
     Iterative research: search, identify gaps, search again.
 
+    Gap identification is VERIFICATION-DRIVEN when a VerificationResult is
+    supplied: the gap-finder sees which claims are TENTATIVE / ACTIVE_DEBATE /
+    UNVERIFIED and targets those holes specifically, instead of squinting at
+    ten 100-char titles.
+
     Opt-in feature: only triggered by depth="thorough".
-    Each cycle identifies knowledge gaps and searches for them.
 
     Args:
         query: Original query
         initial_research: Results from first research cycle
         max_cycles: Maximum number of research cycles
+        verification: Optional verification result driving gap discovery
 
     Returns:
         Enriched ParallelResearchResult with additional sources
@@ -1038,8 +2050,8 @@ async def _iterative_research(
     all_failed = list(initial_research.failed_sources)
 
     for cycle in range(1, max_cycles):
-        # Identify gaps using LLM
-        context = _build_gap_context(query, all_results)
+        # Identify gaps using verification data (richer) or raw titles (fallback)
+        context = _build_gap_context(query, all_results, verification)
         gaps = await _identify_gaps(query, context)
 
         if not gaps:
@@ -1081,12 +2093,30 @@ async def _iterative_research(
     )
 
 
-def _build_gap_context(query: str, results: List[Dict]) -> str:
-    """Build context string for gap identification."""
+def _build_gap_context(
+    query: str,
+    results: List[Dict],
+    verification: Optional[VerificationResult] = None,
+) -> str:
+    """
+    Build context string for gap identification.
+
+    With verification data, leads with the epistemic holes (TENTATIVE /
+    ACTIVE_DEBATE / UNVERIFIED claims) — telling the gap-finder exactly where
+    the evidence is weak — instead of just listing titles.
+    """
     parts = [f"Original query: {query}\n"]
     parts.append(f"Sources found so far: {len(results)}\n")
-    parts.append("Key findings from sources:\n")
 
+    if verification and verification.claims:
+        parts.append("VERIFICATION STATUS OF CURRENT EVIDENCE:\n")
+        for c in verification.claims[:12]:
+            conflict_note = f" — {len(c.conflicting_sources)} conflicting sources" if c.conflicting_sources else ""
+            parts.append(f"  [{c.epistemic_status}] (conf={c.confidence}) {c.statement[:160]}{conflict_note}")
+        weak = sum(1 for c in verification.claims if c.epistemic_status in (EPISTEMIC_TENTATIVE, EPISTEMIC_UNVERIFIED, EPISTEMIC_CONTESTED))
+        parts.append(f"\n{weak} of {len(verification.claims)} claims are weakly supported or contested.\n")
+
+    parts.append("Key findings from sources:\n")
     for i, r in enumerate(results[:10], 1):
         parts.append(f"  [{i}] {r.get('title', 'Untitled')[:80]}: {r.get('snippet', '')[:100]}")
 
@@ -1101,11 +2131,11 @@ async def _identify_gaps(query: str, context: str) -> List[str]:
     """
     from agent.llm_router import synthesize_with_router
 
-    gap_prompt = f"""Given this research query and the sources found so far, identify 1-3 specific knowledge gaps that need more research.
+    gap_prompt = f"""Given this research query and the current evidence status, identify 1-3 specific knowledge gaps that need more research.
 
 {context}
 
-What specific information is still missing or unclear? Return ONLY the gaps as numbered search queries, nothing else.
+Prioritize gaps that would upgrade weak claims (TENTATIVE/UNVERIFIED) to established, or resolve conflicts (ACTIVE_DEBATE). What specific information is still missing or unclear? Return ONLY the gaps as numbered search queries, nothing else.
 Format:
 1. [specific gap as a search query]
 2. [specific gap as a search query]
@@ -1408,6 +2438,7 @@ async def deep_research(
     verify: bool = True,
     extract: bool = False,
     check_retractions: bool = False,
+    use_nli: Optional[bool] = None,
 ) -> Dict:
     """
     Full deep research pipeline combining all upgrades.
@@ -1419,11 +2450,16 @@ async def deep_research(
         verify: Whether to verify claims
         extract: Whether to extract structured claims from P1 sources
         check_retractions: Whether to check DOIs for retraction status
+        use_nli: LLM entailment verification on top of the keyword prefilter.
+            Default: env APEX_USE_NLI ("false" for deep_research — cheaper;
+            generate_research_report defaults to true)
 
     Returns:
         Complete research results dict
     """
     start = time.time()
+    if use_nli is None:
+        use_nli = os.getenv("APEX_USE_NLI_DEEP", "false").lower() in ("1", "true", "yes")
 
     # Step 1: Query decomposition
     sub_queries = await decompose_query(query)
@@ -1474,6 +2510,13 @@ async def deep_research(
     if verify and unique_sources:
         claims = _extract_claims_from_sources(unique_sources)
         verification = verify_claims_from_sources(claims, unique_sources)
+        if use_nli and claims:
+            try:
+                from agent.verifier import verify_claims_with_nli
+                nli_results = await verify_claims_with_nli(claims, unique_sources)
+                verification = _merge_nli_into_verification(verification, nli_results)
+            except Exception as e:
+                logger.warning(f"NLI verification failed, keeping heuristic statuses (non-fatal): {e}")
 
     # Step 6: Structured extraction (opt-in)
     extracted = None

@@ -161,7 +161,7 @@ async def search_semantic_scholar(
                 citation_count=paper.get("citationCount"),
                 open_access=paper.get("isOpenAccess", False),
                 doi=doi,
-                extra={"pdf_url": pdf_url},
+                extra={"pdf_url": pdf_url, "paperId": paper.get("paperId", "")},
             ))
         
         return results
@@ -2252,6 +2252,97 @@ async def search_duckduckgo(
 
 
 # ═══════════════════════════════════════════════════════════════
+# CITATION SNOWBALLING — SEMANTIC SCHOLAR GRAPH EXPANSION
+# ═══════════════════════════════════════════════════════════════
+
+
+async def snowball_semantic_scholar(
+    paper_id: str,
+    direction: str = "citations",
+    max_results: int = 5,
+) -> List[SearchResult]:
+    """
+    Citation snowballing: expand a seed paper via its citation graph.
+
+    direction="citations"  → papers that CITE the seed (forward snowballing;
+      the strongest freshness signal — newer work building on the seed)
+    direction="references" → papers the seed CITES (backward snowballing;
+      foundational work the seed builds on)
+
+    Free: same rate limits as search_semantic_scholar (100 req / 5 min).
+
+    Args:
+        paper_id: Semantic Scholar paperId (from SearchResult.extra["paperId"])
+        direction: "citations" or "references"
+        max_results: Max papers to return
+
+    Returns:
+        List of SearchResult (empty on failure — callers must degrade gracefully)
+    """
+    if not paper_id:
+        return []
+    if direction not in ("citations", "references"):
+        direction = "citations"
+
+    headers = {}
+    if SEMANTIC_SCHOLAR_API_KEY:
+        headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+
+    endpoint = f"https://api.semanticscholar.org/graph/v1/paper/{paper_id}/{direction}"
+
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+            r = await client.get(
+                endpoint,
+                headers=headers,
+                params={
+                    "limit": max_results,
+                    "fields": "title,year,authors,citationCount,isOpenAccess,openAccessPdf,externalIds,url",
+                },
+            )
+            if r.status_code == 429:
+                logger.warning("Semantic Scholar snowball rate limited")
+                return []
+            r.raise_for_status()
+            data = r.json()
+
+        results = []
+        # /citations and /references wrap papers in a "citingPaper"/
+        # "citedPaper" key; handle both plus a bare-paper fallback
+        items = data.get("data", []) or []
+        papers = []
+        for item in items:
+            paper = (item.get("citingPaper") or item.get("citedPaper") or item) if isinstance(item, dict) else {}
+            if paper and paper.get("title"):
+                papers.append(paper)
+
+        for paper in papers[:max_results]:
+            authors = [a.get("name", "") for a in paper.get("authors", []) if a.get("name")]
+            doi = paper.get("externalIds", {}).get("DOI")
+            pdf_url = paper.get("openAccessPdf", {}).get("url", "")
+            results.append(SearchResult(
+                title=paper.get("title", "Untitled"),
+                url=paper.get("url", "") or f"https://semanticscholar.org/paper/{paper.get('paperId', '')}",
+                snippet=f"Cited {paper.get('citationCount', 0)} times. Found via citation {direction} of a seed paper.",
+                source_name="semantic_scholar_snowball",
+                source_category=SourceCategory.ACADEMIC,
+                source_tier="P1",
+                published_date=str(paper.get("year", "")) if paper.get("year") else None,
+                authors=authors,
+                citation_count=paper.get("citationCount"),
+                open_access=paper.get("isOpenAccess", False),
+                doi=doi,
+                extra={"pdf_url": pdf_url, "paperId": paper.get("paperId", "")},
+            ))
+
+        logger.info(f"Snowball ({direction}) from {paper_id[:16]}...: {len(results)} papers")
+        return results
+
+    except Exception as e:
+        logger.warning(f"Semantic Scholar snowball failed: {e}")
+        return []
+
+
 # UNPAYWALL — OPEN ACCESS PDF FINDER
 # ═══════════════════════════════════════════════════════════════
 

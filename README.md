@@ -86,6 +86,37 @@ curl -X POST http://localhost:8000/router/test
 | GET | `/mcp/tools` | List MCP tools |
 | POST | `/mcp/call` | Execute MCP tool |
 
+## APEX 3.0 Report Pipeline
+
+Research reports (`generate_research_report`) no longer use a single
+truncation-prone LLM call. The upgraded pipeline:
+
+```
+Query → Query Expansion (HyDE-style variants)
+      → HYBRID research (live 29-source search ⊕ RAG corpus, concurrent)
+      → Canonical dedup (DOI + title fingerprint) → diverse selection
+        (per-domain caps, P2 quota — replaces the old 5-source hard truncation)
+      → [thorough] Citation snowballing (Semantic Scholar forward citations)
+      → [thorough] Verification-driven iterative gap-filling
+      → FULL-TEXT evidence corpus (Unpaywall OA PDFs + 3-tier scraper,
+        chunked, embedded, per-section retrieval)
+      → Claim extraction + NLI entailment verification (LLM judge, JSON verdicts)
+      → LLM outline → parallel per-section drafting (targeted evidence each)
+      → Assembly (deterministic programmatic bibliography)
+      → Critique pass (citation-integrity check + hostile-reviewer LLM)
+        → one revision pass if defects found
+      → Wiki compile + domain-aware TTL cache
+```
+
+Key guarantees:
+- **Report-grade routing**: report/NLI/outline tasks route to mid/capable
+  models only (4k–8k output caps). Cheap 150-token models can no longer
+  silently truncate a "2000-4000 word" report to ~110 words.
+- **Evidence-grounded**: sections are drafted from full-text passages, not
+  1000-char snippets; every citation `[S1]..[Sn]` maps to a real source.
+- **Measured integrity**: every report carries `citation_metrics`
+  (citation_precision, claim_coverage) and `evidence` stats.
+
 ## Token Rules
 
 | Step | Max Tokens | Action |

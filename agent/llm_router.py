@@ -263,7 +263,7 @@ def _get_default_chain() -> List[ModelConfig]:
             provider=Provider.CLOUDFLARE,
             model_id="@cf/qwen/qwen3-30b-a3b-fp8",
             context_window=32768,
-            max_output_tokens=200,
+            max_output_tokens=4096,
             price_input_per_m=0.051,
             price_output_per_m=0.335,
             supports_tools=True,
@@ -275,7 +275,7 @@ def _get_default_chain() -> List[ModelConfig]:
             provider=Provider.CLOUDFLARE,
             model_id="@cf/meta/llama-3.1-8b-instruct-fp8",
             context_window=131000,
-            max_output_tokens=MAX_SYNTHESIS_TOKENS,
+            max_output_tokens=4096,
             price_input_per_m=0.075,
             price_output_per_m=0.300,
             supports_tools=True,
@@ -287,7 +287,7 @@ def _get_default_chain() -> List[ModelConfig]:
             provider=Provider.CLOUDFLARE,
             model_id="@cf/mistralai/mistral-small-3.1-24b-instruct",
             context_window=128000,
-            max_output_tokens=MAX_SYNTHESIS_TOKENS,
+            max_output_tokens=4096,
             price_input_per_m=0.351,
             price_output_per_m=0.555,
             supports_tools=True,
@@ -299,7 +299,7 @@ def _get_default_chain() -> List[ModelConfig]:
             provider=Provider.CLOUDFLARE,
             model_id="@cf/meta/llama-3.3-70b-instruct-fp8-fast",
             context_window=131000,
-            max_output_tokens=MAX_SYNTHESIS_TOKENS,
+            max_output_tokens=8192,
             price_input_per_m=0.650,
             price_output_per_m=1.300,
             supports_tools=True,
@@ -607,17 +607,31 @@ async def _call_anthropic_direct(
 # ═══════════════════════════════════════════════════════════════
 
 
+# Task types for tier selection.
+#   chat:           default token-efficient behavior (similarity-driven)
+#   classification: cheapest models, tiny outputs
+#   report:         research report generation — mid/capable models ONLY
+#                   (cheap models have 150-token caps that silently truncate reports)
+#   nli:            claim verification / structured JSON — mid models first
+#                   (JSON reliability matters more than price here)
+#   outline:        report outlining — mid models (needs ~800+ output tokens)
+REPORT_TASK_TYPES = ("report", "nli", "outline")
+
+
 def select_tier(
     similarity: Optional[float] = None,
     table_needed: bool = False,
     is_classification: bool = False,
     force_model: Optional[str] = None,
+    task_type: str = "chat",
 ) -> List[ModelConfig]:
     """
     Select which models to try based on the task requirements.
 
     Tier selection logic (loaded from YAML or defaults):
     - Classification tasks: cheapest configured model only (Granite / Llama-1B)
+    - report / nli / outline tasks: mid + capable models ONLY — never the
+      cheap chain, whose 150-token YAML caps silently truncate long outputs
     - similarity > 0.85: pass-through only
     - similarity 0.72-0.85: cheap models
     - similarity < 0.72: all models up to capable
@@ -633,16 +647,24 @@ def select_tier(
         available = [m for m in available if m.name == force_model]
         return available if available else FALLBACK_CHAIN[:1]
 
-    if is_classification:
+    if is_classification or task_type == "classification":
         class_models = [m for m in available if m.tier in ("cheap", "free") and m.provider != Provider.PASSTHROUGH]
         return class_models[:3] if class_models else available[1:3]
 
+    # Report-grade tasks (report generation, NLI verification, outlining):
+    # require mid/capable models with 4k+ output capacity.
+    if task_type in REPORT_TASK_TYPES or table_needed:
+        strong_models = [m for m in available if m.tier in ("mid", "capable", "cloud")]
+        if strong_models:
+            return strong_models
+        # Degraded fallback (credentials missing / YAML gutted): return the
+        # strongest ENABLED models by chain position instead of whatever
+        # happens to be "available" (which could be just the pass-through).
+        enabled = [m for m in FALLBACK_CHAIN if m.enabled]
+        return enabled[-3:] if len(enabled) >= 3 else enabled
+
     if similarity is not None and similarity > 0.85:
         return [FALLBACK_CHAIN[0]]
-
-    if table_needed:
-        table_models = [m for m in available if m.tier in ("mid", "capable", "cloud")]
-        return table_models if table_models else available[3:]
 
     if similarity is not None and similarity < 0.72:
         return available
@@ -661,6 +683,7 @@ async def route_llm_call(
     is_classification: bool = False,
     force_model: Optional[str] = None,
     system_prompt_for_anthropic: str = "",
+    task_type: str = "chat",
 ) -> RouterResult:
     """
     Route an LLM call through the 9-model fallback chain.
@@ -683,6 +706,8 @@ async def route_llm_call(
         is_classification: Whether this is a classification task
         force_model: Force a specific model name
         system_prompt_for_anthropic: System prompt for Anthropic calls
+        task_type: "chat" | "classification" | "report" | "nli" | "outline" —
+            report-grade types route to mid/capable models only
 
     Returns:
         RouterResult with the first successful response
@@ -692,7 +717,7 @@ async def route_llm_call(
         await detect_cloudflare_account_id(CLOUDFLARE_API_TOKEN)
 
     start_time = time.time()
-    models_to_try = select_tier(similarity, table_needed, is_classification, force_model)
+    models_to_try = select_tier(similarity, table_needed, is_classification, force_model, task_type)
 
     attempts: List[Dict[str, Any]] = []
     fallback_count = 0
@@ -843,6 +868,7 @@ async def synthesize_with_router(
     similarity: Optional[float] = None,
     table_needed: bool = False,
     system_prompt: str = "",
+    task_type: str = "chat",
 ) -> RouterResult:
     """
     Synthesize an answer using the tiered fallback router.
@@ -859,6 +885,7 @@ async def synthesize_with_router(
         similarity: RAG similarity score
         table_needed: Whether table format is needed
         system_prompt: APEX system prompt
+        task_type: "chat" | "classification" | "report" | "nli" | "outline"
 
     Returns:
         RouterResult with synthesized answer
@@ -879,6 +906,7 @@ async def synthesize_with_router(
         similarity=similarity,
         table_needed=table_needed,
         system_prompt_for_anthropic=system_prompt,
+        task_type=task_type,
     )
 
 

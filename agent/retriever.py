@@ -261,6 +261,9 @@ async def keyword_search(
     """
     Perform BM25-like keyword search using PostgreSQL tsvector.
 
+    Uses websearch_to_tsquery (supports "quoted phrases" and OR operators)
+    with a plainto_tsquery fallback for malformed queries.
+
     Args:
         query: Search query
         top_k: Number of results
@@ -272,11 +275,19 @@ async def keyword_search(
     conn = await asyncpg.connect(DATABASE_URL, timeout=5.0)
     try:
         # Use inline SQL for keyword search (avoids function signature issues)
+        # websearch_to_tsquery handles "quoted phrases" + OR; coalesce to
+        # plainto_tsquery when the websearch syntax would error out.
         rows = await conn.fetch(
             """SELECT id, source_url, source_tier, domain, title, raw_text,
-                      ts_rank(tsv, plainto_tsquery('english', $1)) AS rank
+                      ts_rank(tsv, COALESCE(
+                          websearch_to_tsquery('english', $1),
+                          plainto_tsquery('english', $1)
+                      )) AS rank
                FROM documents
-               WHERE tsv @@ plainto_tsquery('english', $1)
+               WHERE tsv @@ COALESCE(
+                         websearch_to_tsquery('english', $1),
+                         plainto_tsquery('english', $1)
+                     )
                  AND ($3::text IS NULL OR source_tier = $3::text)
                ORDER BY rank DESC
                LIMIT $2""",
@@ -590,6 +601,7 @@ async def retrieve(
     domain_filter: Optional[str] = None,
     tier_filter: Optional[str] = None,
     use_reranker: bool = True,
+    max_context_tokens: int = MAX_RAG_CONTEXT_TOKENS,
 ) -> Tuple[List[RetrievedChunk], float]:
     """
     Full hybrid retrieval pipeline.
@@ -601,7 +613,7 @@ async def retrieve(
     2. Vector search + keyword search in parallel
     3. Reciprocal Rank Fusion
     4. Source hierarchy enforcement
-    5. Optional reranking
+    5. Optional reranking (Cohere, or Cloudflare LLM-as-reranker fallback)
     6. Token budget enforcement
 
     Args:
@@ -610,7 +622,13 @@ async def retrieve(
         final_k: Final result count after reranking
         domain_filter: Optional domain filter
         tier_filter: Optional tier filter
-        use_reranker: Whether to use Cohere reranker
+        use_reranker: Whether to rerank. NOTE: this now always invokes
+            rerank_cohere(), which internally falls back Cohere → CF AI →
+            fusion scores. Previously the CF reranker was unreachable here
+            because the call was gated on COHERE_API_KEY.
+        max_context_tokens: Token budget for the final context. Chat callers
+            keep the default (2000); report callers should pass 8000-12000 —
+            a 2,000-token context starves evidence-based reports.
 
     Returns:
         Tuple of (final chunks, average similarity score)
@@ -631,14 +649,15 @@ async def retrieve(
         # Step 4: Source hierarchy
         fused = apply_source_hierarchy(fused)
 
-        # Step 5: Reranking
-        if use_reranker and COHERE_API_KEY:
+        # Step 5: Reranking — always delegate; rerank_cohere() handles the
+        # Cohere → CF-AI → fusion-score fallback chain internally.
+        if use_reranker:
             fused = await rerank_cohere(query, fused, final_k)
         else:
             fused = fused[:final_k]
 
         # Step 6: Token budget
-        final_chunks = apply_token_budget(fused, MAX_RAG_CONTEXT_TOKENS)
+        final_chunks = apply_token_budget(fused, max_context_tokens)
 
         # Calculate average similarity
         avg_similarity = (

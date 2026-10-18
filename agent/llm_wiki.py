@@ -253,6 +253,66 @@ def compute_query_hash(query: str, mode: str = "quick", tier: str = "apex-free")
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+# ── Domain-aware cache TTL ──
+# The old write path hardcoded 7 days for everything: an "AI news" report went
+# stale in days while a mathematics report was needlessly regenerated. TTL now
+# follows the domain's knowledge-churn rate (matching research_engine's decay).
+# Global override: APEX_CACHE_TTL_DAYS=<days>
+CACHE_TTL_BY_DOMAIN = {
+    "news": 2,           # current events rot fastest
+    "ai": 7,             # fast-moving research area
+    "software": 14,
+    "biotech": 30,
+    "finance": 14,
+    "medicine": 90,      # clinical evidence is durable
+    "physics": 180,
+    "mathematics": 365,  # proofs don't go stale
+}
+CACHE_TTL_DEFAULT = 14
+
+
+def get_cache_ttl_days(query: str, category: str = "general") -> int:
+    """
+    Cache TTL in days for a query, based on its research domain.
+
+    Env overrides:
+    - APEX_CACHE_TTL_DAYS: force a global TTL for all domains
+    - APEX_CACHE_TTL_<DOMAIN>: per-domain override (e.g. APEX_CACHE_TTL_AI=3)
+    """
+    forced = os.getenv("APEX_CACHE_TTL_DAYS")
+    if forced:
+        try:
+            return max(1, int(forced))
+        except ValueError:
+            pass
+
+    domain = category if category in CACHE_TTL_BY_DOMAIN else "general"
+    if domain == "general":
+        # Lightweight keyword inference (no circular import of research_engine)
+        q = (query or "").lower()
+        hints = [
+            ("ai", ("llm", "gpt", "transformer", "machine learning", "deep learning", "neural")),
+            ("news", ("latest", "breaking", "current", "this week", "recent", "2025", "2026")),
+            ("medicine", ("clinical", "patient", "therapy", "treatment", "drug", "trial")),
+            ("mathematics", ("theorem", "proof", "conjecture")),
+            ("physics", ("quantum", "particle", "relativity")),
+            ("finance", ("market", "monetary", "inflation", "stock")),
+        ]
+        for dom, keywords in hints:
+            if any(k in q for k in keywords):
+                domain = dom
+                break
+
+    override = os.getenv(f"APEX_CACHE_TTL_{domain.upper()}")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+
+    return CACHE_TTL_BY_DOMAIN.get(domain, CACHE_TTL_DEFAULT)
+
+
 def compute_claim_hash(claim: str) -> str:
     """Compute a deterministic hash for a claim."""
     normalized = claim.lower().strip()
@@ -355,8 +415,9 @@ class LLMWikiEngine:
         original_latency_ms: int = 0,
         wiki_page_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        category: str = "general",
     ) -> Optional[str]:
-        """Store a research result in the cache."""
+        """Store a research result in the cache with domain-aware TTL."""
         if not self.db:
             return None
 
@@ -383,7 +444,7 @@ class LLMWikiEngine:
                 "original_latency_ms": original_latency_ms,
                 "wiki_page_id": wiki_page_id,
                 "user_id": user_id,
-                "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat(),
+                "expires_at": (datetime.utcnow() + timedelta(days=get_cache_ttl_days(query, category))).isoformat(),
                 "last_accessed_at": datetime.utcnow().isoformat(),
             }
 
@@ -1186,6 +1247,7 @@ class LLMWikiEngine:
             original_latency_ms=original_latency_ms,
             wiki_page_id=page.id,
             user_id=user_id,
+            category=category,
         )
 
         return page, cache_id
