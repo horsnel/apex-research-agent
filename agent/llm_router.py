@@ -383,51 +383,60 @@ async def _call_cloudflare(
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model_id,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                    "temperature": temperature,
-                },
-            )
-            latency = int((time.time() - start) * 1000)
-
-            if response.status_code != 200:
-                error_text = response.text[:300]
-                logger.warning(f"Cloudflare {model_id} returned {response.status_code}: {error_text}")
-                return LLMCallResult(
-                    success=False,
-                    content="",
-                    model_name=model_id,
-                    model_id=model_id,
-                    provider="cloudflare",
-                    latency_ms=latency,
-                    error=f"HTTP {response.status_code}: {error_text}",
+            # Transient empty responses (observed live on Qwen3/Llama under
+            # burst load): retry the SAME model once after a short backoff
+            # before falling through to the next model in the chain.
+            for attempt in range(2):
+                response = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": model_id,
+                        "messages": messages,
+                        "max_tokens": max_tokens,
+                        "temperature": temperature,
+                    },
                 )
+                latency = int((time.time() - start) * 1000)
 
-            data = response.json()
-            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content")
-            # Some models (e.g. Qwen3 MoE reasoning mode) return None content
-            content = (raw_content or "").strip()
-            usage = data.get("usage", {})
-            tokens_used = usage.get("total_tokens", 0)
+                if response.status_code != 200:
+                    error_text = response.text[:300]
+                    logger.warning(f"Cloudflare {model_id} returned {response.status_code}: {error_text}")
+                    return LLMCallResult(
+                        success=False,
+                        content="",
+                        model_name=model_id,
+                        model_id=model_id,
+                        provider="cloudflare",
+                        latency_ms=latency,
+                        error=f"HTTP {response.status_code}: {error_text}",
+                    )
 
-            if not content:
-                return LLMCallResult(
-                    success=False,
-                    content="",
-                    model_name=model_id,
-                    model_id=model_id,
-                    provider="cloudflare",
-                    latency_ms=latency,
-                    error="Empty response (model returned None/empty content)",
-                )
+                data = response.json()
+                raw_content = data.get("choices", [{}])[0].get("message", {}).get("content")
+                # Some models (e.g. Qwen3 MoE reasoning mode) return None content
+                content = (raw_content or "").strip()
+                usage = data.get("usage", {})
+                tokens_used = usage.get("total_tokens", 0)
+
+                if content:
+                    break
+                if attempt == 0:
+                    logger.info(f"Cloudflare {model_id} returned empty content — retrying once after backoff")
+                    await asyncio.sleep(1.5)
+                else:
+                    return LLMCallResult(
+                        success=False,
+                        content="",
+                        model_name=model_id,
+                        model_id=model_id,
+                        provider="cloudflare",
+                        latency_ms=latency,
+                        error="Empty response (model returned None/empty content, 1 retry)",
+                    )
 
             return LLMCallResult(
                 success=True,

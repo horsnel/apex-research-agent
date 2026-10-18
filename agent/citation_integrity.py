@@ -16,8 +16,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 
-# Numbered citations: [S2], [S2, P1], [2], [3,5], [S2, S3]
-NUMBERED_CITATION = re.compile(r'\[(?:S(\d{1,3}(?:\s*,\s*\d{1,3})*))|(\d{1,3}(?:\s*,\s*\d{1,3})*)\]')
+# Numbered citations: [S2], [2], [3,5], [S2, S3], [S2, S3, S5] — brackets
+# REQUIRED; the S prefix may appear on the first element or on every element
+NUMBERED_CITATION = re.compile(r'\[S?(\d{1,3}(?:\s*,\s*S?\d{1,3})*)\]')
 
 # Tiered author citations: [Author 2024, P1], [domain.com, P2], [UNVERIFIED]
 TIERED_CITATION = re.compile(r'\[[^\]]+,\s*(?:P[123]|UNV)\]|\[UNVERIFIED\]')
@@ -62,12 +63,10 @@ def extract_numbered_citations(text: str) -> List[int]:
     """Extract all source numbers referenced via [S2] / [S2, S3] / [2] / [3,5] citations."""
     numbers: List[int] = []
     for m in NUMBERED_CITATION.finditer(text):
-        raw_list = m.group(1) or m.group(2)
-        if not raw_list:
-            continue
-        for part in raw_list.split(","):
+        for part in m.group(1).split(","):
+            part = part.strip().lstrip("Ss").strip()
             try:
-                numbers.append(int(part.strip()))
+                numbers.append(int(part))
             except ValueError:
                 continue
     return numbers
@@ -179,3 +178,80 @@ def build_sources_section(sources: List[Dict]) -> str:
         alt_str = f" (also: {', '.join(alt[:2])})" if alt else ""
         lines.append(f"[S{i}] [{tier}] {author_str}{title}. {year}. {url}{cc_str}{alt_str}")
     return "\n".join(lines)
+
+
+def prune_uncited_sources(report_text: str, sources: List[Dict]) -> Tuple[str, List[Dict], Dict]:
+    """
+    Premium bibliography hygiene: remove sources that are NEVER cited in the
+    report body, then renumber the remaining [Sn] citations and rebuild the
+    bibliography deterministically (no gaps, no dead entries).
+
+    The SOURCES section is excluded from citation extraction so the
+    bibliography's own [S1]..[Sn] labels don't count as "citations".
+
+    Returns:
+        (new_report_text, new_sources, stats) where stats = {
+            "pruned": [old 1-based indices removed],
+            "before": n_sources_before,
+            "after": n_sources_after,
+            "renumbered": True/False,
+        }
+        If every source is cited, returns (report_text, sources, {"pruned": []...}).
+    """
+    stats = {"pruned": [], "before": len(sources), "after": len(sources), "renumbered": False}
+    if not sources or not report_text:
+        return report_text, sources, stats
+
+    # Split body from the deterministic bibliography (built by build_sources_section)
+    m = re.search(r"\n## SOURCES\b", report_text)
+    if not m:
+        return report_text, sources, stats
+    body = report_text[:m.start()]
+    tail = report_text[m.start():]
+
+    cited = sorted({n for n in extract_numbered_citations(body) if 1 <= n <= len(sources)})
+    dead = [i for i in range(1, len(sources) + 1) if i not in set(cited)]
+    stats["pruned"] = dead
+
+    if not dead:
+        return report_text, sources, stats
+
+    # Old index -> new index (dense renumbering, order preserved)
+    mapping: Dict[int, int] = {}
+    for new_idx, old_idx in enumerate(cited, start=1):
+        mapping[old_idx] = new_idx
+
+    def _renumber(m_: "re.Match") -> str:
+        parts = []
+        for part in m_.group(1).split(","):
+            p = part.strip()
+            num = re.sub(r"^S", "", p).strip()
+            try:
+                old = int(num)
+            except ValueError:
+                parts.append(p)
+                continue
+            parts.append(str(mapping.get(old, old)))
+        return f"[S{', '.join(parts)}]"
+
+    new_body = re.sub(r'\[S?(\d{1,3}(?:\s*,\s*S?\d{1,3})*)\]', _renumber, body)
+
+    new_sources = [sources[old - 1] for old in cited]
+    new_tail = "\n\n" + build_sources_section(new_sources)
+
+    stats["after"] = len(new_sources)
+    stats["renumbered"] = True
+    return new_body.rstrip() + new_tail, new_sources, stats
+
+
+def rebuild_bibliography(report_text: str, sources: List[Dict]) -> str:
+    """
+    Replace whatever SOURCES section exists (e.g. an LLM-regenerated one from
+    a revision pass) with the deterministic bibliography for `sources`.
+    Keeps the body untouched — numbering must already match [S1]..[Sn].
+    """
+    m = re.search(r"\n## SOURCES\b", report_text)
+    canonical = "\n\n" + build_sources_section(sources)
+    if not m:
+        return report_text.rstrip() + canonical
+    return report_text[:m.start()] + canonical

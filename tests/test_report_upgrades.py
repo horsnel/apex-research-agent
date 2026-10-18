@@ -436,3 +436,135 @@ class TestQueryVariantLabelStripping:
         monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
         variants = asyncio.run(re_mod.expand_query_variants("base query", max_variants=3))
         assert "A perfectly clean variant without any label prefix" in variants[1]
+
+
+class TestPruneUncitedSources:
+    """Dead-source pruning with deterministic renumbering."""
+
+    def _mk(self, n):
+        return [{"url": f"https://src{i}.com/a", "title": f"Source {i}", "tier": "P1",
+                 "snippet": f"snippet {i}"} for i in range(1, n + 1)]
+
+    def test_no_dead_sources_unchanged(self):
+        from agent.citation_integrity import prune_uncited_sources
+        srcs = self._mk(3)
+        text = "Claims [S1, S2] and [S3].\n\n## SOURCES\n[S1] a\n[S2] b\n[S3] c"
+        new_text, new_srcs, stats = prune_uncited_sources(text, srcs)
+        assert stats["pruned"] == []
+        assert new_text == text
+        assert new_srcs == srcs
+
+    def test_dead_sources_pruned_and_renumbered(self):
+        from agent.citation_integrity import prune_uncited_sources
+        srcs = self._mk(4)
+        body = ("Alpha [S1] beta. Gamma [S3] delta [S4]. "
+                "\n\n## SOURCES\n[S1] a\n[S2] b\n[S3] c\n[S4] d")
+        new_text, new_srcs, stats = prune_uncited_sources(body, srcs)
+        assert stats["pruned"] == [2]
+        assert stats["after"] == 3
+        assert len(new_srcs) == 3
+        # S3 -> S2, S4 -> S3
+        assert "[S2] delta" in new_text or "[S2] delta [S3]" in new_text
+        assert "[S4]" not in new_text
+        assert "[S2]" in new_text and "[S3]" in new_text
+        # bibliography rebuilt with exactly the cited sources
+        assert new_text.count("[S") >= 3
+        assert "Source 2" not in new_text
+        assert "Source 3" in new_text and "Source 4" in new_text
+
+    def test_multi_citation_form_renumbered(self):
+        from agent.citation_integrity import prune_uncited_sources
+        srcs = self._mk(3)
+        body = "Mixed form [S2, S3] with more [S1].\n\n## SOURCES\nx"
+        new_text, new_srcs, stats = prune_uncited_sources(body, srcs)
+        assert stats["pruned"] == []
+        assert "[S2, S3]" in new_text or "[S2,S3]" in new_text
+
+    def test_no_sources_section_unchanged(self):
+        from agent.citation_integrity import prune_uncited_sources
+        srcs = self._mk(2)
+        text = "Body only, no bibliography [S1]."
+        new_text, new_srcs, stats = prune_uncited_sources(text, srcs)
+        assert new_text == text and stats["pruned"] == []
+
+
+class TestRelevanceGate:
+    """Loosely-related retrieval padding must be dropped before selection."""
+
+    def _src(self, title, snippet, tier="P1", url=None):
+        return {"url": url or f"https://{title[:8].replace(' ', '')}.com/a",
+                "title": title, "snippet": snippet, "tier": tier}
+
+    def test_irrelevant_sources_dropped(self):
+        from agent.research_engine import select_diverse_sources
+        query = "meta-analysis of unpublished negative-result trials"
+        sources = [
+            self._src("Footprint of publication selection bias on meta-analyses",
+                      "68,000 meta-analyses; unpublished negative results; publication bias; trials"),
+            self._src("IPPOG: Bridging science education and modern research",
+                      "particle physics outreach masterclasses for school students", url="https://ippo.org/x"),
+            self._src("Bupropion pharmacology review",
+                      "antidepressant drug used for smoking cessation treatment", url="https://wiki.org/b"),
+            self._src("Trial registration policies and unpublished outcomes",
+                      "clinical trials registries require registration of negative results", tier="P2",
+                      url="https://trials.org/x"),
+        ]
+        selected = select_diverse_sources(sources, query=query, relevance_floor=2)
+        titles = [s["title"] for s in selected]
+        assert "Bupropion pharmacology review" not in titles
+        assert "IPPOG: Bridging science education and modern research" not in titles
+        assert "Footprint of publication selection bias on meta-analyses" in titles
+
+    def test_floor_prevents_degenerate_selection(self):
+        from agent.research_engine import select_diverse_sources
+        query = "quantum chromodynamics lattice gauge calculations"
+        sources = [
+            self._src("Completely unrelated topic one", "nothing shared here at all"),
+            self._src("Completely unrelated topic two", "also nothing shared whatsoever"),
+        ]
+        selected = select_diverse_sources(sources, query=query, relevance_floor=2)
+        assert len(selected) == 2  # floor top-up, never empty
+
+    def test_no_query_bypasses_gate(self):
+        from agent.research_engine import select_diverse_sources
+        sources = [
+            self._src("A", "x"), self._src("B", "y"), self._src("C", "z"),
+        ]
+        selected = select_diverse_sources(sources, query="")
+        assert len(selected) == 3
+
+
+class TestRebuildBibliography:
+    """A revision pass regenerates SOURCES itself — the canonical bibliography
+    must always be restored before dead-source pruning."""
+
+    def test_llm_bibliography_replaced(self):
+        from agent.citation_integrity import rebuild_bibliography
+        srcs = [{"url": f"https://s{i}.com", "title": f"Canonical {i}", "tier": "P1",
+                 "snippet": "", "published_date": "2024"} for i in (1, 2)]
+        text = ("Body [S1] more [S2].\n\n## SOURCES\n"
+                "[S1] LLM invented format one\n[S2] LLM invented format two")
+        out = rebuild_bibliography(text, srcs)
+        assert "Canonical 1" in out and "Canonical 2" in out
+        assert "LLM invented" not in out
+        assert out.startswith("Body [S1] more [S2].")
+
+    def test_appends_when_missing(self):
+        from agent.citation_integrity import rebuild_bibliography
+        srcs = [{"url": "https://s1.com", "title": "Only", "tier": "P1", "snippet": ""}]
+        out = rebuild_bibliography("Body text [S1].", srcs)
+        assert "## SOURCES" in out and "Only" in out
+
+    def test_full_post_revise_pipeline(self):
+        """Rebuild → prune order: uncited padding dropped even when the
+        revision LLM kept it in its own bibliography."""
+        from agent.citation_integrity import rebuild_bibliography, prune_uncited_sources
+        srcs = [{"url": f"https://s{i}.com", "title": f"Src{i}", "tier": "P1", "snippet": ""}
+                for i in range(1, 4)]
+        revised = ("A [S1] and [S2].\n\n## SOURCES\n"
+                   "[S1] x\n[S2] y\n[S3] padding the LLM kept")
+        t = rebuild_bibliography(revised, srcs)
+        t2, s2, stats = prune_uncited_sources(t, srcs)
+        assert stats["pruned"] == [3]
+        assert "Src3" not in t2
+        assert t2.count("## SOURCES") == 1

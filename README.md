@@ -101,10 +101,17 @@ Query → Query Expansion (HyDE-style variants)
       → FULL-TEXT evidence corpus (Unpaywall OA PDFs + 3-tier scraper,
         chunked, embedded, per-section retrieval)
       → Claim extraction + NLI entailment verification (LLM judge, JSON verdicts)
-      → LLM outline → parallel per-section drafting (targeted evidence each)
+      → LLM outline (evidence-accurate title + mandatory SCOPE & EVIDENCE
+        BASE section — the report never promises more than the evidence
+        base supports)
+      → parallel per-section drafting (targeted evidence each)
       → Assembly (deterministic programmatic bibliography)
-      → Critique pass (citation-integrity check + hostile-reviewer LLM)
-        → one revision pass if defects found
+      → Critique pass (citation-integrity check + hostile-reviewer LLM,
+        incl. FRAMING_MISMATCH detection)
+        → one revision pass if defects found (trimmed retry on rejection)
+      → Deterministic bibliography rebuild + DEAD-SOURCE PRUNING (sources
+        never cited in the body are dropped, [Sn] tags renumbered — zero
+        uncited bibliography padding)
       → Wiki compile + domain-aware TTL cache
 ```
 

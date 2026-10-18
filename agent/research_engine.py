@@ -300,11 +300,42 @@ def dedup_sources_canonical(sources: List[Dict]) -> List[Dict]:
     return deduped
 
 
+_STOPWORDS = {
+    "what", "which", "that", "this", "with", "from", "have", "has", "had",
+    "are", "were", "been", "their", "them", "they", "about", "into", "over",
+    "than", "then", "when", "where", "while", "some", "such", "only", "more",
+    "most", "much", "many", "also", "between", "among", "both", "each",
+    "does", "did", "doing", "done", "make", "made", "make", "take", "took",
+    "never", "made", "public", "there", "here", "will", "would", "could",
+    "should", "might", "must", "shall", "may", "can", "cannot", "using",
+    "used", "use", "new", "non", "not", "and", "for", "the", "its",
+}
+
+
+def _content_words(text: str) -> set:
+    """Lowercased alphanumeric content words (len>=4, stopwords removed)."""
+    words = re.findall(r"[a-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in _STOPWORDS}
+
+
+def _source_relevance(source: Dict, query_vocab: set) -> float:
+    """Fraction of query content words appearing in the source title+snippet."""
+    if not query_vocab:
+        return 1.0
+    text = f"{(source.get('title') or '')} {(source.get('snippet') or '')}".lower()
+    shared = sum(1 for w in query_vocab if w in text)
+    return shared / len(query_vocab)
+
+
 def select_diverse_sources(
     sources: List[Dict],
     max_sources: int = 25,
     per_domain_cap: int = 3,
     min_p2: int = 2,
+    query: str = "",
+    query_variants: Optional[List[str]] = None,
+    min_relevance: float = 0.15,
+    relevance_floor: int = 5,
 ) -> List[Dict]:
     """
     Report-grade source selection: preserve BREADTH instead of hard-truncating
@@ -312,6 +343,11 @@ def select_diverse_sources(
     gathered evidence).
 
     Selection strategy:
+    0. RELEVANCE GATE — drop sources whose title+snippet share (nearly) no
+       content words with the query or its expansion variants. Live retrieval
+       grabs loosely-related papers (a drug page, an outreach program); citing
+       them is padding. A small floor of top-relevance survivors is guaranteed
+       so a genuinely niche query never ends up with zero sources.
     1. Rank all sources by adjusted_score (temporal decay already applied)
     2. Walk the ranked list, capping per-domain representation (default 3)
        so one prolific domain doesn't crowd out diverse perspectives
@@ -324,6 +360,11 @@ def select_diverse_sources(
         max_sources: Maximum sources to return (report context allows 20-30)
         per_domain_cap: Max sources per base domain
         min_p2: Minimum P2 sources to include when available
+        query: Original query (drives the relevance gate when provided)
+        query_variants: Expanded query variants (unioned into the vocabulary)
+        min_relevance: Minimum shared-content-word fraction to keep a source
+        relevance_floor: If fewer sources survive the gate, top up with the
+            highest-relevance rejects so selection never degenerates
 
     Returns:
         Selected, diversity-balanced list of sources
@@ -334,6 +375,34 @@ def select_diverse_sources(
     # Re-enforce tier from URL so selection sees accurate tiers
     for s in sources:
         s["tier"] = enforce_source_tier(s.get("url", ""), s.get("tier", "UNV"))
+
+    # ── Pass 0: relevance gate ──
+    dropped_irrelevant = 0
+    if query:
+        vocab = _content_words(query)
+        for v in (query_variants or []):
+            vocab |= _content_words(v)
+        if vocab:
+            scored = [( _source_relevance(s, vocab), s) for s in sources]
+            kept = [s for rel, s in scored if rel >= min_relevance]
+            dropped_irrelevant = len(sources) - len(kept)
+            if len(kept) < relevance_floor:
+                # Top up with the highest-relevance rejects (not highest-score)
+                by_rel = sorted(scored, key=lambda t: t[0], reverse=True)
+                seen = {id(s) for s in kept}
+                for rel, s in by_rel:
+                    if len(kept) >= relevance_floor:
+                        break
+                    if id(s) not in seen:
+                        kept.append(s)
+                        seen.add(id(s))
+                kept = kept[:relevance_floor]
+            if dropped_irrelevant:
+                logger.info(
+                    f"Relevance gate: dropped {dropped_irrelevant} low-relevance "
+                    f"sources (vocab={len(vocab)} words, threshold={min_relevance})"
+                )
+            sources = kept
 
     ranked = sorted(
         sources,
@@ -1098,6 +1167,7 @@ RULES:
 class ResearchReport:
     """A structured research report with verified claims."""
     query: str
+    title: str = ""  # evidence-accurate report title (may reframe the query)
     executive_summary: str = ""
     findings: List[Dict] = field(default_factory=list)
     debates: List[Dict] = field(default_factory=list)
@@ -1151,6 +1221,7 @@ Given the report and its numbered source list, identify ONLY these defect types:
 2. MISSING_CITATION: a factual claim sentence with no citation
 3. UNSUPPORTED_SUPERLATIVE: sweeping claims ("most", "best", "proves") without evidence
 4. STALE_EVIDENCE: claims resting on clearly outdated sources when newer ones exist
+5. FRAMING_MISMATCH: the title or section structure promises an analysis the cited evidence cannot deliver (e.g. claims to study X directly when the evidence only supports an indirect estimate related to X) — the fix is a reframing instruction, never invented evidence
 
 Return ONLY valid JSON:
 {"issues": [{"section_heading": "...", "type": "...", "detail": "...", "fix": "specific instruction"}]}
@@ -1164,12 +1235,13 @@ DEFAULT_QUICK_SECTIONS = [
 ]
 
 DEFAULT_THOROUGH_SECTIONS = [
+    {"id": "scope", "title": "SCOPE & EVIDENCE BASE", "purpose": "State what the evidence base actually supports: what was retrievable, what could NOT be analyzed directly, and any framing limits — BEFORE any findings", "key_questions": ["What evidence was actually retrieved?", "What could not be analyzed directly and why?", "Does the evidence support the query's literal demand?"]},
     {"id": "exec_summary", "title": "EXECUTIVE SUMMARY", "purpose": "Key findings, overall confidence, critical gaps, why it matters", "key_questions": ["What are the most important established findings?", "What remains uncertain or contested?", "Why does this topic matter now?"]},
     {"id": "key_findings", "title": "KEY FINDINGS", "purpose": "8-15 detailed findings with evidence table and epistemic status", "key_questions": ["What did the strongest P1/P2 sources find?", "Which findings are ESTABLISHED vs TENTATIVE?", "What numbers/effect sizes are reported?"]},
     {"id": "comparative", "title": "COMPARATIVE ANALYSIS", "purpose": "Multi-dimension comparison table of approaches/methods/options with trade-off analysis", "key_questions": ["What are the main approaches/options?", "How do they differ across key dimensions?", "When is each optimal?"]},
-    {"id": "evidence_quality", "title": "EVIDENCE QUALITY MATRIX", "purpose": "Table of evidence types, counts, confidence, key limitations", "key_questions": ["What study types back the findings?", "Where is the evidence weak or missing?"]},
+    {"id": "evidence_quality", "title": "EVIDENCE QUALITY MATRIX", "purpose": "Table of evidence types, counts, confidence, key limitations — ONLY evidence actually retrieved; never list the query's core subject as an evidence row unless it was directly studied", "key_questions": ["What study types back the findings?", "Where is the evidence weak or missing?"]},
     {"id": "debates", "title": "ACTIVE DEBATES", "purpose": "Points where sources conflict — both sides with citations", "key_questions": ["Where do sources disagree?", "Which side has stronger evidence?"]},
-    {"id": "speculative", "title": "SPECULATIVE FINDINGS", "purpose": "Early inferences needing replication, with confirmation criteria", "key_questions": ["What looks promising but is unproven?", "What evidence would confirm or falsify it?"]},
+    {"id": "speculative", "title": "SPECULATIVE FINDINGS", "purpose": "Inferences extrapolated ONLY from cited evidence, needing replication, with confirmation criteria — omit the section entirely if the evidence base supports no responsible extrapolation", "key_questions": ["What do the CITED sources jointly imply that none states alone?", "What evidence would confirm or falsify it?"]},
     {"id": "methodology", "title": "METHODOLOGY NOTES", "purpose": "Sample sizes, study designs, biases, geographic/temporal limits", "key_questions": ["What are the methodology caveats?", "What biases might skew the evidence?"]},
     {"id": "implications", "title": "PRACTICAL IMPLICATIONS & RECOMMENDATIONS", "purpose": "Actionable recommendations with confidence and risks, plus future research directions", "key_questions": ["What should the reader do?", "What questions remain open?"]},
 ]
@@ -1312,12 +1384,17 @@ async def _generate_outline(
     sources: List[Dict],
     verification: Optional[VerificationResult],
     depth: str,
-) -> List[Dict]:
+) -> tuple:
     """
     Outline-first planning: an LLM proposes the report's sections given the
     evidence inventory (claims with epistemic status + source titles).
 
-    Falls back to the built-in default section plan on any failure.
+    Also produces an EVIDENCE-ACCURATE title: if the retrievable evidence only
+    supports an indirect analysis of the query, the title must say so instead
+    of parroting the query (prevents the framing bait-and-switch).
+
+    Returns (sections, report_title). Falls back to the built-in default
+    section plan and query-as-title on any failure.
     """
     from agent.llm_router import synthesize_with_router
 
@@ -1347,8 +1424,13 @@ VERIFIED CLAIMS SO FAR:
 Choose 4-{len(DEFAULT_THOROUGH_SECTIONS)} sections. You may adapt the standard structure
 (Executive Summary, Key Findings, Comparative Analysis, Evidence Quality, Active Debates, Speculative Findings, Methodology Notes, Practical Implications) to fit the evidence — drop sections with no evidence, add a section if the evidence demands it.
 
+FRAMING HONESTY (MANDATORY):
+1. report_title: an HONEST title describing what the evidence base actually supports — NOT the query verbatim. If the sources only permit an INDIRECT analysis of the query's literal subject, the title must reflect that (e.g. "What publication-bias research reveals about the scale of the unpublished-trial problem").
+2. The FIRST section MUST be titled "SCOPE & EVIDENCE BASE" and must state: what evidence was actually retrievable, what could NOT be analyzed directly, and whether the query's literal demand is methodologically feasible with this evidence base.
+3. Never plan a section that implies direct evidence for the query's core subject unless such sources exist above.
+
 Return ONLY valid JSON:
-{{"sections": [{{"id": "kebab-id", "title": "SECTION TITLE", "purpose": "1 sentence", "key_questions": ["q1", "q2"]}}]}}"""
+{{"report_title": "...", "sections": [{{"id": "kebab-id", "title": "SECTION TITLE", "purpose": "1 sentence", "key_questions": ["q1", "q2"]}}]}}"""
 
     try:
         result = await synthesize_with_router(
@@ -1366,6 +1448,7 @@ Return ONLY valid JSON:
         if m:
             data = json.loads(m.group())
             sections = data.get("sections", [])
+            report_title = str(data.get("report_title", "")).strip()[:200]
             # Validate: need id/title/purpose; cap at 9 sections
             valid = []
             for s in sections[:9]:
@@ -1378,11 +1461,11 @@ Return ONLY valid JSON:
                     })
             if len(valid) >= 3:
                 logger.info(f"Outline generated: {len(valid)} sections via {result.model_name}")
-                return valid
+                return valid, (report_title or query)
     except Exception as e:
         logger.debug(f"Outline generation failed, using default structure: {e}")
 
-    return [dict(s) for s in defaults]
+    return [dict(s) for s in defaults], query
 
 
 def _claims_for_section(section: Dict, verification: Optional[VerificationResult], max_claims: int = 8) -> str:
@@ -1481,16 +1564,20 @@ Cite with [S{{n}}] tags ONLY from the inventory above."""
         return section.get("id", "section"), "", ""
 
 
-def _assemble_report(section_markdowns: List[str], sources: List[Dict]) -> str:
+def _assemble_report(section_markdowns: List[str], sources: List[Dict], title: str = "") -> str:
     """
     Assemble section drafts into a full report.
     The SOURCES bibliography is built PROGRAMMATICALLY (deterministic —
     the LLM never gets to invent the source list).
+
+    The H1 title is the outline's evidence-accurate title (never the raw
+    query when the evidence supports only an indirect analysis).
     """
     from agent.citation_integrity import build_sources_section
 
     body = "\n\n".join(md.strip() for md in section_markdowns if md and md.strip())
-    return f"{body}\n\n{build_sources_section(sources)}"
+    header = f"# {title}\n\n" if title else ""
+    return f"{header}{body}\n\n{build_sources_section(sources)}"
 
 
 async def _critique_and_revise(
@@ -1564,7 +1651,8 @@ Find the worst hallucinated citations, missing citations, and unsupported superl
         f"[S{i}] [{s.get('tier', 'UNV')}] {(s.get('title') or 'Untitled')[:100]}: {(s.get('snippet') or '')[:350]}"
         for i, s in enumerate(sources, 1)
     )
-    revise_prompt = f"""Fix the defects flagged by review in this research report. Change ONLY what the issues require — keep everything else verbatim.
+    def _revise_prompt(rpt_text: str) -> str:
+        return f"""Fix the defects flagged by review in this research report. Change ONLY what the issues require — keep everything else verbatim.
 
 QUERY: {query}
 
@@ -1575,28 +1663,41 @@ NUMBERED SOURCE INVENTORY (only [S1]..[S{len(sources)}] exist):
 {sources_blob}
 
 REPORT:
-{report_text[:14000]}
+{rpt_text[:14000]}
 
-Return the FULL corrected report (same structure, ## sections, [Sn] citations, SOURCES section at the end)."""
+Return the FULL corrected report (same structure and LENGTH, ## sections, [Sn] citations, SOURCES section at the end). Do not shorten the report."""
 
-    try:
+    async def _attempt_revision(rpt_text: str) -> tuple:
         result = await synthesize_with_router(
             query="revise report",
-            context=revise_prompt,
+            context=_revise_prompt(rpt_text),
             max_tokens=8192,
             system_prompt=SECTION_DRAFT_SYSTEM_PROMPT,
             task_type="report",
         )
         content = result.content.strip()
-        if not content.startswith("[ALL_LLM_FAILED]") and len(content) > len(report_text) * 0.5:
-            critique_summary["revised"] = True
-            # Re-check citations after revision
-            post = check_report_citations(content, sources)
-            critique_summary["citation_precision"] = post.citation_precision
-            critique_summary["claim_coverage"] = post.claim_coverage
-            return content, critique_summary, result.model_name
-    except Exception as e:
-        logger.debug(f"Revision pass failed (non-fatal): {e}")
+        ok = not content.startswith("[ALL_LLM_FAILED]") and len(content) > len(rpt_text) * 0.5
+        return content, ok, result.model_name
+
+    for attempt, (rpt_text, label) in enumerate(
+        [(report_text, "full"), (report_text[:10000], "trimmed")], start=1
+    ):
+        try:
+            content, ok, model_name = await _attempt_revision(rpt_text)
+            if ok:
+                critique_summary["revised"] = True
+                critique_summary["revision_attempts"] = attempt
+                # Re-check citations after revision
+                post = check_report_citations(content, sources)
+                critique_summary["citation_precision"] = post.citation_precision
+                critique_summary["claim_coverage"] = post.claim_coverage
+                return content, critique_summary, model_name
+            logger.info(
+                f"Revision attempt {attempt} ({label}) rejected: "
+                f"len={len(content)} vs threshold={int(len(rpt_text) * 0.5)}"
+            )
+        except Exception as e:
+            logger.info(f"Revision attempt {attempt} ({label}) failed: {e}")
 
     return report_text, critique_summary, ""
 
@@ -1682,14 +1783,24 @@ async def generate_research_report(
 
     # ── Step 3: Canonical dedup → diverse selection → domain-aware decay ──
     all_sources = dedup_sources_canonical(all_sources)
-    all_sources = select_diverse_sources(all_sources, max_sources=28 if depth == "thorough" else 18)
+    all_sources = select_diverse_sources(
+        all_sources,
+        max_sources=28 if depth == "thorough" else 18,
+        query=query,
+        query_variants=variants,
+    )
 
     # ── Step 4: Snowball top academic seeds (thorough mode adds the most) ──
     if depth == "thorough":
         snowballed = await _snowball_sources(all_sources)
         if snowballed:
             merged = dedup_sources_canonical(all_sources + snowballed)
-            all_sources = select_diverse_sources(merged, max_sources=30)
+            all_sources = select_diverse_sources(
+                merged,
+                max_sources=30,
+                query=query,
+                query_variants=variants,
+            )
 
     # ── Step 5: Iterative gap-filling (thorough, verification-driven) ──
     if depth == "thorough" and max_cycles > 1:
@@ -1705,6 +1816,8 @@ async def generate_research_report(
             all_sources = select_diverse_sources(
                 dedup_sources_canonical(enriched.results),
                 max_sources=30,
+                query=query,
+                query_variants=variants,
             )
 
     if not all_sources:
@@ -1742,8 +1855,8 @@ async def generate_research_report(
             logger.warning(f"NLI verification failed, keeping heuristic statuses (non-fatal): {e}")
 
     # ── Step 8: OUTLINE ──
-    outline = await _generate_outline(query, all_sources, verification, depth)
-    logger.info(f"Report outline: {[s['title'] for s in outline]}")
+    outline, report_title = await _generate_outline(query, all_sources, verification, depth)
+    logger.info(f"Report outline: {[s['title'] for s in outline]} | title={report_title!r}")
 
     # ── Step 9: PARALLEL SECTION DRAFTING ──
     draft_tasks = [
@@ -1772,16 +1885,36 @@ async def generate_research_report(
         raw_report = await _generate_report_text(query, all_sources, verification, depth)
         generation_mode = "single_call"
     else:
-        raw_report = _assemble_report(sections_md, all_sources)
+        raw_report = _assemble_report(sections_md, all_sources, title=report_title)
 
     # ── Step 10: CRITIQUE + REVISE (citation integrity loop) ──
     raw_report, critique, revise_model = await _critique_and_revise(raw_report, query, all_sources, depth)
     if revise_model:
         models_used.append(revise_model)
 
+    # ── Step 10.5: DETERMINISTIC BIBLIOGRAPHY + DEAD-SOURCE PRUNING ──
+    # A revision pass regenerates the whole report INCLUDING its SOURCES
+    # section — so first restore the canonical bibliography, then drop any
+    # source the body never cites and renumber [Sn] tags deterministically.
+    from agent.citation_integrity import prune_uncited_sources, rebuild_bibliography
+    raw_report = rebuild_bibliography(raw_report, all_sources)
+    raw_report, all_sources, prune_stats = prune_uncited_sources(raw_report, all_sources)
+    critique["dead_sources_pruned"] = prune_stats.get("pruned", [])
+    if prune_stats.get("pruned"):
+        # Recompute metrics on the pruned text
+        from agent.citation_integrity import check_report_citations
+        post_prune = check_report_citations(raw_report, all_sources)
+        critique["citation_precision"] = post_prune.citation_precision
+        critique["claim_coverage"] = post_prune.claim_coverage
+        logger.info(
+            f"Pruned {len(prune_stats['pruned'])} uncited sources: "
+            f"{prune_stats['before']} → {prune_stats['after']} (renumbered)"
+        )
+
     # ── Step 11: Parse + finalize ──
     report = _parse_report(raw_report)
     report.query = query
+    report.title = report_title or query
     report.verification = verification
     report.total_latency_ms = int((time.time() - start) * 1000)
     report.depth = depth
