@@ -9,6 +9,7 @@ Covers the pure (no-I/O, no-LLM) logic added across the phases:
 Run: pytest tests/test_report_upgrades.py -v
 """
 
+import asyncio
 import os
 import sys
 
@@ -383,3 +384,55 @@ class TestHeuristicVerificationCompat:
         result = verify_claims_from_sources(claims, sources)
         assert result.claims
         assert result.claims[0].epistemic_status in ("ESTABLISHED", "TENTATIVE")
+
+
+class TestQueryVariantLabelStripping:
+    """Regression: LLM-written angle labels ('Technical: ...') must be stripped
+    from expanded variants — raw colons break downstream source APIs
+    (ClinicalTrials.gov returns HTTP 400 on bare colons in query.term)."""
+
+    def test_label_prefixes_stripped(self, monkeypatch):
+        import agent.research_engine as re_mod
+        from agent.llm_router import RouterResult
+
+        fake = RouterResult(
+            content=(
+                "1. Technical: Comparative analysis of unpublished negative-result trials\n"
+                "2. Empirical: Effect size distortion from publication selection bias\n"
+                "3. Practical: How registries capture trials that never publish\n"
+            ),
+            model_name="Granite-4.0-Micro",
+            model_id="x",
+            provider="cloudflare",
+            fallback_count=0,
+            total_latency_ms=1,
+        )
+
+        async def fake_synth(*a, **k):
+            return fake
+
+        monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
+        variants = asyncio.run(re_mod.expand_query_variants("base query", max_variants=4))
+        assert all(":" not in v for v in variants), variants
+        assert any("Comparative analysis" in v for v in variants)
+        assert not any(v.lower().startswith("technical") for v in variants)
+
+    def test_clean_variants_untouched(self, monkeypatch):
+        import agent.research_engine as re_mod
+        from agent.llm_router import RouterResult
+
+        fake = RouterResult(
+            content="1. A perfectly clean variant without any label prefix\n",
+            model_name="Granite-4.0-Micro",
+            model_id="x",
+            provider="cloudflare",
+            fallback_count=0,
+            total_latency_ms=1,
+        )
+
+        async def fake_synth(*a, **k):
+            return fake
+
+        monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
+        variants = asyncio.run(re_mod.expand_query_variants("base query", max_variants=3))
+        assert "A perfectly clean variant without any label prefix" in variants[1]

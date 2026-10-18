@@ -1203,7 +1203,17 @@ Return ONLY numbered queries, one per line, nothing else."""
         for line in result.content.split("\n"):
             m = re.match(r'^\d+[\.\)]\s*(.+)', line.strip())
             if m and len(m.group(1).strip()) > 10:
-                variants.append(m.group(1).strip())
+                variant = m.group(1).strip()
+                # LLMs often prefix variants with angle labels like
+                # "Technical:", "Empirical:", "Practical:" — strip them, since
+                # raw colons break downstream source APIs (e.g. ClinicalTrials.gov).
+                variant = re.sub(
+                    r'^(technical|empirical|practical|state[- ]of[- ]the[- ]art|'
+                    r'methodological|theoretical|applied|perspective)\s*[:\-\u2013]\s*',
+                    '', variant, flags=re.IGNORECASE,
+                ).strip()
+                if len(variant) > 10:
+                    variants.append(variant)
         return variants[:max_variants]
     except Exception as e:
         logger.debug(f"Query expansion failed (non-fatal): {e}")

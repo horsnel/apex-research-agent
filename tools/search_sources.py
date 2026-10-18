@@ -365,11 +365,18 @@ async def search_clinical_trials(
     evidence-based medicine queries.
     """
     try:
+        # ClinicalTrials.gov query.term is fragile: bare colons / quotes /
+        # angle-label prefixes (e.g. "Technical: ...") from query expansion
+        # cause HTTP 400. Keep alphanumerics + spaces + hyphens only.
+        safe_query = re.sub(r"[^\w\s-]", " ", query, flags=re.UNICODE)
+        safe_query = re.sub(r"\s+", " ", safe_query).strip()
+        if not safe_query:
+            return []
         async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
             r = await client.get(
                 "https://clinicaltrials.gov/api/v2/studies",
                 params={
-                    "query.term": query,
+                    "query.term": safe_query,
                     "pageSize": max_results,
                     "fields": "protocolSection.identificationModule,protocolSection.statusModule,protocolSection.designModule",
                 },
