@@ -568,3 +568,70 @@ class TestRebuildBibliography:
         assert stats["pruned"] == [3]
         assert "Src3" not in t2
         assert t2.count("## SOURCES") == 1
+
+
+class TestTotalLLMFailureHonesty:
+    """Live-found under a Cloudflare daily-quota outage: when every model in
+    the fallback chain fails, the router returns an [ALL_LLM_FAILED] sentinel
+    which the single-call fallback used to return verbatim — marching a stub
+    through critique/prune/parse as if it were a report. It must raise instead."""
+
+    def test_single_call_raises_on_sentinel(self, monkeypatch):
+        import agent.research_engine as re_mod
+        from agent.llm_router import RouterResult
+        from agent.research_engine import VerificationResult
+
+        fake = RouterResult(
+            content="[ALL_LLM_FAILED] No model could generate a response. Check API keys and rate limits.",
+            model_name="", model_id="x", provider="cloudflare",
+            fallback_count=4, total_latency_ms=1,
+        )
+
+        async def fake_synth(*a, **k):
+            return fake
+
+        monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
+        with pytest.raises(RuntimeError, match="all LLM providers"):
+            asyncio.run(re_mod._generate_report_text(
+                "query", [], VerificationResult(claims=[]), "quick",
+            ))
+
+    def test_single_call_raises_on_degenerate_output(self, monkeypatch):
+        import agent.research_engine as re_mod
+        from agent.llm_router import RouterResult
+        from agent.research_engine import VerificationResult
+
+        fake = RouterResult(
+            content="Too short.",   # <80 chars, no sentinel — still not a report
+            model_name="Llama-3.1-8B", model_id="x", provider="cloudflare",
+            fallback_count=0, total_latency_ms=1,
+        )
+
+        async def fake_synth(*a, **k):
+            return fake
+
+        monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
+        with pytest.raises(RuntimeError, match="no usable output"):
+            asyncio.run(re_mod._generate_report_text(
+                "query", [], VerificationResult(claims=[]), "quick",
+            ))
+
+    def test_valid_report_passes_through(self, monkeypatch):
+        import agent.research_engine as re_mod
+        from agent.llm_router import RouterResult
+        from agent.research_engine import VerificationResult
+
+        body = "## EXECUTIVE SUMMARY\n" + ("Real analysis " * 40)
+        fake = RouterResult(
+            content=body, model_name="Qwen3-30B", model_id="x",
+            provider="cloudflare", fallback_count=0, total_latency_ms=1,
+        )
+
+        async def fake_synth(*a, **k):
+            return fake
+
+        monkeypatch.setattr("agent.llm_router.synthesize_with_router", fake_synth)
+        out = asyncio.run(re_mod._generate_report_text(
+            "query", [], VerificationResult(claims=[]), "quick",
+        ))
+        assert out == body

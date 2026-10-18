@@ -2099,7 +2099,17 @@ async def _generate_report_text(
         task_type="report",  # mid/capable models ONLY — never 150-token cheap tiers
     )
 
-    return router_result.content
+    content = router_result.content or ""
+    # Honest total-failure: the router returns an [ALL_LLM_FAILED] sentinel when
+    # every model in the chain fails (live-seen under a daily-quota outage).
+    # Raise here instead of letting a stub masquerade as a report through
+    # critique → pruning → parsing — callers must see the real problem.
+    if content.startswith("[ALL_LLM_FAILED]") or len(content.strip()) < 80:
+        raise RuntimeError(
+            "APEX report generation failed: all LLM providers returned no usable "
+            f"output. Router said: {content[:160]}"
+        )
+    return content
 
 
 def _parse_report(raw: str) -> ResearchReport:
