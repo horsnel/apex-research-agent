@@ -1656,25 +1656,38 @@ async def _critique_and_revise(
     query: str,
     sources: List[Dict],
     depth: str,
+    extra_issues: Optional[List[str]] = None,
 ) -> tuple:
     """
-    Critique pass: mechanical citation-integrity check + hostile-reviewer LLM
-    pass. If real issues surface, ONE revision call regenerates the report
-    with the issue list as feedback.
+    Critique pass: mechanical citation-integrity check + canonical-method
+    scan + hostile-reviewer LLM pass. If real issues surface, ONE revision
+    call regenerates the report with the issue list as feedback.
+
+    extra_issues: pre-formatted issue strings from the late canonical
+    backfill (method named in draft, primary source fetched and appended
+    after drafting) — they enter the revision feedback verbatim.
 
     Returns (final_text, critique_summary_dict, model_used).
     """
     from agent.llm_router import synthesize_with_router
-    from agent.citation_integrity import check_report_citations, scan_claim_source_alignment
+    from agent.citation_integrity import (
+        check_report_citations, scan_claim_source_alignment,
+        scan_concept_boundary_mismatch,
+    )
+    from agent.canonical_sources import scan_canonical_method_usage
 
     citation_report = check_report_citations(report_text, sources)
     alignment_flags = scan_claim_source_alignment(report_text, sources)
+    boundary_flags = scan_concept_boundary_mismatch(report_text, sources)
+    canonical_issues = scan_canonical_method_usage(report_text, sources)
     critique_summary = {
         "citation_precision": citation_report.citation_precision,
         "claim_coverage": citation_report.claim_coverage,
         "invalid_citations": citation_report.invalid_citations,
         "uncited_claims": len(report_text and citation_report.uncited_claim_sentences or []),
         "alignment_flags": len(alignment_flags),
+        "boundary_flags": len(boundary_flags),
+        "canonical_issues": len(canonical_issues),
         "llm_issues": 0,
         "revised": False,
     }
@@ -1688,13 +1701,20 @@ async def _critique_and_revise(
             for i, s in enumerate(sources, 1)
         )
         alignment_blob = ""
-        if alignment_flags:
+        mechanical_flags = list(alignment_flags) + [
+            {"source": f["source"], "excerpt": f["excerpt"], "reason": f.get("reason", "")}
+            for f in boundary_flags
+        ]
+        if mechanical_flags:
             pairs = "\n".join(
-                f"  - [S{f['source']}] ← “{f['excerpt']}”" for f in alignment_flags
+                f"  - [S{f['source']}] ← “{f['excerpt']}”"
+                + (f"\n        (mechanical hypothesis: {f['reason']})" if f.get("reason") else "")
+                for f in mechanical_flags
             )
             alignment_blob = (
-                "\nMECHANICALLY FLAGGED PAIRS (cited source shares no content words "
-                "with the claim — verify against the source list first):\n" + pairs + "\n"
+                "\nMECHANICALLY FLAGGED PAIRS (cited source may not support the "
+                "claim — verify against the source list first; a hypothesis is "
+                "attached where the mismatch is conceptual, not just lexical):\n" + pairs + "\n"
             )
         critique_prompt = f"""REPORT TO REVIEW (may be truncated):
 {report_text[:14000]}
@@ -1722,7 +1742,15 @@ Find the worst hallucinated citations, missing citations, and unsupported superl
         logger.debug(f"LLM critique failed (non-fatal): {e}")
 
     critique_summary["llm_issues"] = len(llm_issues)
-    all_issues = list(citation_report.issues) + [f"[{i.get('type')}] {i.get('detail')} → {i.get('fix')}" for i in llm_issues]
+    canonical_issue_strs = [
+        f"[{i['type']}] {i['detail']} → {i['fix']}" for i in canonical_issues
+    ]
+    all_issues = (
+        list(extra_issues or [])
+        + list(citation_report.issues)
+        + canonical_issue_strs
+        + [f"[{i.get('type')}] {i.get('detail')} → {i.get('fix')}" for i in llm_issues]
+    )
 
     if not all_issues:
         return report_text, critique_summary, ""
@@ -1902,6 +1930,30 @@ async def generate_research_report(
                 query_variants=variants,
             )
 
+    # ── Step 5.5: CANONICAL-SOURCE BACKFILL (registry-verified, deterministic) ──
+    # Keyword retrieval finds papers CONTAINING the topic's words; the papers
+    # that DEFINE those words (Egger's test, trim-and-fill, ROB-ME, ...) are
+    # routinely missed — the live failure behind four consecutive critiques.
+    # When the query/variants/pool name a registered method-or-topic, fetch
+    # the actual primary literature from Crossref BY verified DOI and add it
+    # to the pool. Backfilled sources are ordinary pool members: they flow
+    # through NLI, evidence fetching (Unpaywall takes DOIs), drafting, and
+    # the deterministic bibliography. Failures degrade silently.
+    backfilled_ids: List[str] = []
+    try:
+        from agent.canonical_sources import ensure_canonical_sources
+        pool_signal = " ".join(
+            f"{s.get('title', '')} {s.get('snippet', '')}" for s in all_sources
+        )
+        all_sources, backfilled = await ensure_canonical_sources(
+            " ".join([query, *variants, pool_signal]),
+            all_sources,
+            max_add=8 if depth == "thorough" else 5,
+        )
+        backfilled_ids = [b["entry_id"] for b in backfilled]
+    except Exception as e:
+        logger.warning(f"Canonical backfill failed (non-fatal): {e}")
+
     if not all_sources:
         # Absolute fallback: single-call generation on empty evidence
         raw_report = f"# Research Report\n\n## EXECUTIVE SUMMARY\n\nNo sources could be retrieved for this query. Try again or broaden the query.\n"
@@ -1917,7 +1969,7 @@ async def generate_research_report(
     try:
         from agent.evidence_fetcher import build_evidence_corpus, evidence_stats
         corpus = await build_evidence_corpus(all_sources, top_n=6 if depth == "quick" else 8)
-        ev_stats = evidence_stats(corpus)
+        ev_stats = None
     except Exception as e:
         logger.warning(f"Evidence corpus build failed (non-fatal): {e}")
         from agent.evidence_fetcher import EvidenceCorpus
@@ -1970,9 +2022,35 @@ async def generate_research_report(
         raw_report = _assemble_report(sections_md, all_sources, title=report_title)
 
     # ── Step 10: CRITIQUE + REVISE (citation integrity loop) ──
-    raw_report, critique, revise_model = await _critique_and_revise(raw_report, query, all_sources, depth)
+    # Late canonical backfill: if the DRAFT itself names a registered method
+    # (e.g. "trim-and-fill") whose primary source is not in the pool, fetch
+    # it now (appended as [S{n+1}...] — existing numbering untouched) and
+    # make the revision cite it or drop the name.
+    canonical_issues: List[str] = []
+    try:
+        from agent.canonical_sources import late_backfill_for_draft
+        canonical_issues, late_added = await late_backfill_for_draft(raw_report, all_sources)
+        backfilled_ids.extend(a["entry_id"] for a in late_added)
+    except Exception as e:
+        logger.warning(f"Late canonical backfill failed (non-fatal): {e}")
+
+    raw_report, critique, revise_model = await _critique_and_revise(
+        raw_report, query, all_sources, depth, extra_issues=canonical_issues
+    )
     if revise_model:
         models_used.append(revise_model)
+    critique["canonical_backfilled"] = backfilled_ids
+
+    # Evidence stats are captured AFTER drafting/critique: used_semantic starts
+    # optimistic at build time and is corrected during retrieval (degenerate
+    # embedding output → keyword fallback). A build-time snapshot lied about
+    # semantic scoring in live runs with a provider outage.
+    if ev_stats is None:
+        try:
+            from agent.evidence_fetcher import evidence_stats
+            ev_stats = evidence_stats(corpus)
+        except Exception:
+            ev_stats = {"chunks": 0, "fetched_sources": 0, "failed_sources": 0, "total_chars": 0, "semantic_scoring": False}
 
     # ── Step 10.5: DETERMINISTIC BIBLIOGRAPHY + DEAD-SOURCE PRUNING ──
     # A revision pass regenerates the whole report INCLUDING its SOURCES

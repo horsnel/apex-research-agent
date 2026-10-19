@@ -204,6 +204,56 @@ def _is_crossref_paper(item: dict) -> bool:
     return True
 
 
+def _strip_jats(text: str) -> str:
+    """Crossref abstracts often carry JATS XML tags (<jats:p>, <jats:italic>).
+    Strip tags + entities + collapsed whitespace so snippets are plain prose."""
+    if not text:
+        return ""
+    import html as _html
+    plain = re.sub(r"<[^>]+>", " ", text)
+    plain = _html.unescape(plain)
+    return re.sub(r"\s+", " ", plain).strip()
+
+
+def _crossref_item_to_result(item: dict) -> SearchResult:
+    """Shape one Crossref message item into a normalized SearchResult.
+    Shared by search_crossref (query path) and fetch_crossref_by_doi
+    (exact-DOI backfill path)."""
+    authors = []
+    for a in item.get("author", []):
+        name = f"{a.get('given', '')} {a.get('family', '')}".strip()
+        if name:
+            authors.append(name)
+
+    doi = item.get("DOI", "")
+    title_list = item.get("title", ["Untitled"])
+    title = title_list[0] if title_list else "Untitled"
+
+    pub_date = item.get("published-print", {}).get("date-parts", [[None]])[0]
+    pub_year = str(pub_date[0]) if pub_date and pub_date[0] else None
+
+    is_oa = item.get("license", []) and any(
+        l.get("content-version") == "vor" for l in item.get("license", [])
+    )
+
+    abstract = _strip_jats(item.get("abstract", "") or "")
+    snippet = abstract[:600] if abstract else f"DOI: {doi}"
+
+    return SearchResult(
+        title=title,
+        url=f"https://doi.org/{doi}" if doi else item.get("URL", ""),
+        snippet=snippet,
+        source_name="crossref",
+        source_category=SourceCategory.ACADEMIC,
+        source_tier="P1",
+        published_date=pub_year,
+        authors=authors,
+        citation_count=item.get("is-referenced-by-count"),
+        open_access=is_oa,
+        doi=doi,
+    )
+
+
 async def search_crossref(
     query: str,
     max_results: int = DEFAULT_MAX_RESULTS,
@@ -239,42 +289,38 @@ async def search_crossref(
             # through relevance gates, then get cited as fake methodology.
             if not _is_crossref_paper(item):
                 continue
-            authors = []
-            for a in item.get("author", []):
-                name = f"{a.get('given', '')} {a.get('family', '')}".strip()
-                if name:
-                    authors.append(name)
-            
-            doi = item.get("DOI", "")
-            title_list = item.get("title", ["Untitled"])
-            title = title_list[0] if title_list else "Untitled"
-            
-            pub_date = item.get("published-print", {}).get("date-parts", [[None]])[0]
-            pub_year = str(pub_date[0]) if pub_date and pub_date[0] else None
-            
-            is_oa = item.get("license", []) and any(
-                l.get("content-version") == "vor" for l in item.get("license", [])
-            )
-            
-            results.append(SearchResult(
-                title=title,
-                url=f"https://doi.org/{doi}" if doi else item.get("URL", ""),
-                snippet=item.get("abstract", "")[:300] if item.get("abstract") else f"DOI: {doi}",
-                source_name="crossref",
-                source_category=SourceCategory.ACADEMIC,
-                source_tier="P1",
-                published_date=pub_year,
-                authors=authors,
-                citation_count=item.get("is-referenced-by-count"),
-                open_access=is_oa,
-                doi=doi,
-            ))
-        
+            results.append(_crossref_item_to_result(item))
+
         return results
-    
+
     except Exception as e:
         logger.warning(f"Crossref search failed: {e}")
         return []
+
+
+async def fetch_crossref_by_doi(doi: str) -> Optional[SearchResult]:
+    """
+    Fetch the exact Crossref record for ONE DOI (works/{doi} endpoint).
+
+    This is the deterministic retrieval path for canonical-source backfill:
+    a known-good DOI returns exactly one record — no relevance ranking can
+    substitute a different paper. Callers still validate the returned title
+    against the expected one (agent.canonical_sources.titles_match) so a
+    registry typo or publisher re-registration fails loudly instead of
+    injecting the wrong work.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://api.crossref.org/works/{(doi or '').strip()}",
+                params={"mailto": CONTACT_EMAIL},
+            )
+            r.raise_for_status()
+            item = r.json().get("message", {})
+        return _crossref_item_to_result(item)
+    except Exception as e:
+        logger.warning(f"Crossref DOI fetch failed for {doi}: {e}")
+        return None
 
 
 async def search_openalex(

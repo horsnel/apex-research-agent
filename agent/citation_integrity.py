@@ -336,3 +336,86 @@ def scan_claim_source_alignment(
                 break  # one flag per sentence is enough for adjudication
 
     return flags
+
+
+# ── Concept-boundary mismatch scan ──────────────────────────────────
+# Live failure: Silva et al. (2018), a privacy-preserving federated-learning
+# paper, was cited 4 runs in a row for "accessing unpublished trials".
+# Federated learning makes EXISTING institutionally-held data analyzable
+# across sites; it says nothing about trials that were never published or
+# registered. Zero-overlap alignment can't catch this — the words "trials"
+# and "data" overlap — so the mismatch is CONCEPTUAL and needs a boundary
+# table: (what the source is about) × (what the claim presupposes).
+
+_CONCEPT_BOUNDARIES = [
+    {
+        "name": "existing-private-data vs never-published-data",
+        # Source side: >=2 distinct markers ⇒ the source is about analyzing
+        # data that exists but is held privately / across institutions.
+        "source_markers": (
+            r"federated", r"privacy[- ]preserving", r"privacy", r"decentralis|decentraliz",
+            r"cross[- ]silo", r"multi(?:-| )[ct]", r"secure (?:computation|aggregation|multiparty)",
+            r"patient[- ](?:level|record)", r"electronic health record",
+        ),
+        # Claim side: the sentence presupposes data that was never made public.
+        "claim_markers": (
+            r"unpublished", r"unregistered", r"never[- ](?:report|publish|registr)",
+            r"never made (?:it |)public", r"unreport", r"missing (?:trial|study|data)",
+            r"not (?:in any|in public) (?:database|registry)",
+        ),
+        "reason": (
+            "the cited source is about analyzing data that exists but is held "
+            "privately across institutions — it cannot support claims about "
+            "trials/data that were never published or registered"
+        ),
+    },
+]
+
+
+def scan_concept_boundary_mismatch(
+    report_text: str,
+    sources: List[Dict],
+    max_flags: int = 3,
+) -> List[Dict]:
+    """Deterministic concept-boundary check for cited sentences.
+
+    A flag is raised when a cited source sits on one side of a declared
+    conceptual boundary while the citing sentence presupposes the other
+    side. Flags go to the critique LLM for adjudication, same as the
+    zero-overlap alignment flags.
+    """
+    flags: List[Dict] = []
+
+    main_text = report_text
+    bib_match = re.search(r'\n##\s*SOURCES\b.*\Z', report_text, re.DOTALL | re.IGNORECASE)
+    if bib_match:
+        main_text = report_text[:bib_match.start()]
+
+    lines = [ln for ln in main_text.split("\n") if not ln.strip().startswith(("#", "|"))]
+    sentences = re.split(r"(?<=[.!?])\s+", "\n".join(lines))
+
+    for sentence in sentences:
+        if len(sentence.split()) < 8 or len(flags) >= max_flags:
+            continue
+        cited = sorted({n for n in extract_numbered_citations(sentence) if 1 <= n <= len(sources)})
+        if not cited:
+            continue
+        for boundary in _CONCEPT_BOUNDARIES:
+            claim_hit = any(re.search(p, sentence, re.I) for p in boundary["claim_markers"])
+            if not claim_hit:
+                continue
+            for n in cited:
+                src = sources[n - 1]
+                src_text = f"{src.get('title') or ''} {src.get('snippet') or ''}".lower()
+                hits = [p for p in boundary["source_markers"] if re.search(p, src_text)]
+                if len(hits) >= 2:
+                    flags.append({
+                        "source": n,
+                        "excerpt": sentence.strip()[:160],
+                        "reason": boundary["reason"],
+                    })
+                    break
+            if len(flags) and flags[-1]["source"] in cited:
+                break  # one flag per sentence is enough for adjudication
+
+    return flags

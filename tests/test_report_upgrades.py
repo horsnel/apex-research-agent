@@ -810,3 +810,347 @@ class TestDegenerateSemanticFallback:
         assert out is not None and len(out) == 2
         assert out[0] > out[1]
         assert not all(abs(s) <= 1e-9 for s in out)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CANONICAL-SOURCE BACKFILL — named methods must stand on primary literature
+# ═══════════════════════════════════════════════════════════════════
+
+from types import SimpleNamespace
+
+
+class TestCanonicalRegistry:
+    def test_registry_entries_are_well_formed(self):
+        from agent.canonical_sources import REGISTRY
+        priorities = set()
+        for e in REGISTRY:
+            assert e.entry_id and e.doi and e.expected_title
+            assert "/" in e.doi, f"{e.entry_id}: DOI should contain a slash"
+            assert 1950 <= e.expected_year <= 2025
+            assert e.why and e.label
+            priorities.add(e.priority)
+        assert len(priorities) == len(REGISTRY), "priorities must be unique"
+
+    def test_method_entries_cover_the_named_canon(self):
+        from agent.canonical_sources import _METHOD_ENTRIES
+        ids = {e.entry_id for e in _METHOD_ENTRIES}
+        assert {"egger1997", "duval2000", "rosenthal1979", "cochrane_robme", "sterne2011"} <= ids
+
+
+class TestCanonicalDetection:
+    def test_topic_query_triggers_method_entries_via_compound(self):
+        from agent.canonical_sources import detect_canonical_entries
+        q = ("Meta-analysis of unpublished negative-result trials that never "
+             "made it into public databases")
+        ids = [e.entry_id for e in detect_canonical_entries(q)]
+        for expected in ("egger1997", "duval2000", "cochrane_robme", "rosenthal1979"):
+            assert expected in ids, f"{expected} should be triggered by topic compound"
+
+    def test_method_name_triggers_its_own_entry(self):
+        from agent.canonical_sources import detect_canonical_entries
+        ids = [e.entry_id for e in detect_canonical_entries("we applied trim-and-fill to adjust the pooled estimate")]
+        assert ids == ["duval2000"]
+
+    def test_federated_learning_query_triggers_nothing(self):
+        from agent.canonical_sources import detect_canonical_entries
+        q = "Privacy-preserving federated learning for multi-center healthcare analytics"
+        assert detect_canonical_entries(q) == []
+
+    def test_no_vacuous_matching_on_arbitrary_text(self):
+        # Regression: entries with trigger_all=() must not fire via vacuous all()
+        from agent.canonical_sources import detect_canonical_entries
+        assert detect_canonical_entries("the quick brown fox jumps over the lazy dog") == []
+
+    def test_off_topic_query_triggers_nothing(self):
+        from agent.canonical_sources import detect_canonical_entries
+        q = "coral reef biodiversity loss across indonesian marine protected areas"
+        assert detect_canonical_entries(q) == []
+
+
+class TestTitleValidation:
+    def test_unicode_hyphen_titles_match(self):
+        from agent.canonical_sources import titles_match
+        fetched = ("Trim and Fill: A Simple Funnel\u2010Plot\u2013Based Method of Testing "
+                   "and Adjusting for Publication Bias in Meta\u2010Analysis")
+        assert titles_match(fetched, "Trim and Fill: A Simple Funnel-Plot-Based Method of Testing and Adjusting for Publication Bias in Meta-Analysis")
+
+    def test_wrong_paper_rejected(self):
+        from agent.canonical_sources import titles_match
+        assert not titles_match(
+            "Reversibility of Serum Removal Effects on IGF-II mRNA in Human Neuroblastoma Cells",
+            "The file drawer problem and tolerance for null results",
+        )
+
+    def test_subtitle_extra_tokens_are_fine(self):
+        from agent.canonical_sources import titles_match
+        fetched = ("Empirical Evidence for Selective Reporting of Outcomes in "
+                   "Randomized Trials: Comparison of Protocols to Published Articles")
+        assert titles_match(fetched, "Empirical Evidence for Selective Reporting of Outcomes in Randomized Trials")
+
+    def test_normalize_doi(self):
+        from agent.canonical_sources import normalize_doi
+        assert normalize_doi("https://doi.org/10.1136/BMJ.315.7109.629") == "10.1136/bmj.315.7109.629"
+        assert normalize_doi("doi: 10.1111/j.0006-341X.2000.00455.x") == "10.1111/j.0006-341x.2000.00455.x"
+
+
+def _fake_result(title="Trim and Fill: A Simple Funnel-Plot-Based Method of Testing and Adjusting for Publication Bias in Meta-Analysis",
+                 year="2000", snippet="Simulation studies show the estimator performs well.", **kw):
+    return SimpleNamespace(
+        title=title, url=f"https://doi.org/{kw.get('doi', 'x')}", snippet=snippet,
+        published_date=year, authors=["Sue Duval", "Richard Tweedie"],
+        citation_count=12308, doi=kw.get("doi", "x"),
+    )
+
+
+def _registry_fetcher(called):
+    """Fake Crossref fetcher that returns each registry entry's own verified
+    identity — validates that backfill works end-to-end for ANY entry."""
+    from agent.canonical_sources import REGISTRY
+    by_doi = {e.doi: e for e in REGISTRY}
+
+    async def fake_fetch(doi):
+        called.append(doi)
+        e = by_doi.get(doi)
+        if e is None:
+            return None
+        return SimpleNamespace(
+            title=e.expected_title, url=f"https://doi.org/{e.doi}",
+            snippet=f"Canonical abstract for {e.label}.",
+            published_date=str(e.expected_year), authors=["A. Author"],
+            citation_count=999, doi=e.doi,
+        )
+
+    return fake_fetch
+
+
+class TestCanonicalBackfill:
+    def test_happy_path_appends_validated_source(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "Some unrelated paper", "snippet": "nothing relevant"}]
+        called = []
+
+        async def fake_fetch(doi):
+            called.append(doi)
+            return _fake_result(doi="10.1111/j.0006-341X.2000.00455.x")
+
+        signal = "we need trim-and-fill adjustment for publication bias"
+        sources, added = asyncio.run(ensure_canonical_sources(signal, pool, max_add=1, fetcher=fake_fetch))
+        assert called == ["10.1111/j.0006-341X.2000.00455.x"]
+        assert len(added) == 1 and added[0]["entry_id"] == "duval2000" and added[0]["index"] == 2
+        s = sources[1]
+        assert s["tier"] == "P1" and s["canonical_id"] == "duval2000"
+        assert s["doi"] == "10.1111/j.0006-341x.2000.00455.x"
+        assert s["authors"] == ["Sue Duval", "Richard Tweedie"]
+        assert s["citation_count"] == 12308 and s["backfilled"] is True
+
+    def test_identity_mismatch_rejected(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "unrelated", "snippet": ""}]
+
+        async def fake_fetch(doi):
+            return _fake_result(title="Reversibility of Serum Removal Effects on IGF-II mRNA", year="1993")
+
+        sources, added = asyncio.run(ensure_canonical_sources("trim-and-fill", pool, max_add=3, fetcher=fake_fetch))
+        assert added == [] and len(sources) == 1
+
+    def test_year_mismatch_rejected(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "unrelated", "snippet": ""}]
+
+        async def fake_fetch(doi):
+            return _fake_result(year="2014")
+
+        sources, added = asyncio.run(ensure_canonical_sources("trim-and-fill", pool, max_add=3, fetcher=fake_fetch))
+        assert added == [] and len(sources) == 1
+
+    def test_fetch_failure_degrades_silently(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "unrelated", "snippet": ""}]
+
+        async def fake_fetch(doi):
+            return None
+
+        sources, added = asyncio.run(ensure_canonical_sources("trim-and-fill", pool, max_add=3, fetcher=fake_fetch))
+        assert added == [] and len(sources) == 1
+
+    def test_already_in_pool_not_duplicated(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "Trim and Fill: A Simple Funnel-Plot-Based Method", "snippet": "",
+                 "doi": "10.1111/j.0006-341x.2000.00455.x", "canonical_id": "duval2000"}]
+        fetches = []
+
+        async def fake_fetch(doi):
+            fetches.append(doi)
+            return _fake_result()
+
+        sources, added = asyncio.run(ensure_canonical_sources("trim-and-fill everywhere", pool, max_add=3, fetcher=fake_fetch))
+        assert added == [] and fetches == [] and len(sources) == 1
+
+    def test_max_add_caps_injection(self):
+        import asyncio
+        from agent.canonical_sources import ensure_canonical_sources
+        pool = [{"title": "unrelated", "snippet": ""}]
+        called = []
+
+        sources, added = asyncio.run(
+            ensure_canonical_sources("meta-analysis of unpublished negative trials", pool,
+                                     max_add=2, fetcher=_registry_fetcher(called))
+        )
+        assert len(called) == 2
+        assert {a["entry_id"] for a in added} == {"egger1997", "duval2000"}  # priority order
+
+
+class TestLateBackfillForDraft:
+    REPORT = ("## FINDINGS\n\nThe trim-and-fill adjustment corrected the pooled "
+              "estimate for funnel-plot asymmetry [S1]. Nothing else here.\n\n"
+              "## SOURCES\n\n[S1] [P3] Someone. Something. 2015.")
+
+    def test_missing_method_source_gets_fetched_and_flagged(self):
+        import asyncio
+        from agent.canonical_sources import late_backfill_for_draft
+        pool = [{"title": "Encyclopedia entry", "snippet": "background", "url": "https://en.wikipedia.org/wiki/x"}]
+        called = []
+
+        issues, added = asyncio.run(late_backfill_for_draft(self.REPORT, pool, fetcher=_registry_fetcher(called)))
+        # Draft names trim-and-fill AND funnel-plot asymmetry → both primaries fetched
+        assert called == ["10.1111/j.0006-341X.2000.00455.x", "10.1136/bmj.d4002"]
+        assert {a["entry_id"] for a in added} == {"duval2000", "sterne2011"}
+        assert len(pool) == 3
+        assert sum("CANONICAL_SOURCE_ADDED" in i for i in issues) == 2
+        assert any("[S2]" in i for i in issues) and any("[S3]" in i for i in issues)
+
+    def test_present_method_source_triggers_no_fetch(self):
+        import asyncio
+        from agent.canonical_sources import late_backfill_for_draft
+
+        def pool_with(entry_id, title, doi):
+            return {"title": title, "snippet": "", "doi": doi, "canonical_id": entry_id}
+
+        pool = [
+            pool_with("duval2000", "Trim and Fill: A Simple Funnel-Plot-Based Method",
+                      "10.1111/j.0006-341x.2000.00455.x"),
+            pool_with("sterne2011", "Recommendations for examining and interpreting funnel plot asymmetry",
+                      "10.1136/bmj.d4002"),
+        ]
+        called = []
+
+        issues, added = asyncio.run(late_backfill_for_draft(self.REPORT, pool, fetcher=_registry_fetcher(called)))
+        assert called == [] and added == [] and issues == []
+
+    def test_failed_fetch_produces_missing_issue(self):
+        import asyncio
+        from agent.canonical_sources import late_backfill_for_draft
+        pool = [{"title": "Encyclopedia entry", "snippet": "background", "url": "https://en.wikipedia.org/wiki/x"}]
+
+        async def fake_fetch(doi):
+            return None
+
+        issues, added = asyncio.run(late_backfill_for_draft(self.REPORT, pool, fetcher=fake_fetch))
+        assert added == []
+        assert any("CANONICAL_SOURCE_MISSING" in i for i in issues)
+
+
+class TestScanCanonicalMethodUsage:
+    def test_named_method_without_primary_source_flagged(self):
+        from agent.canonical_sources import scan_canonical_method_usage
+        sources = [{"title": "Publication bias - Wikipedia", "snippet": "background article",
+                    "url": "https://en.wikipedia.org/wiki/Publication_bias"}]
+        report = ("## FINDINGS\n\nEgger's regression test demonstrated significant "
+                  "asymmetry across all included studies of published trials [S1].")
+        issues = scan_canonical_method_usage(report, sources)
+        assert len(issues) == 1
+        assert issues[0]["type"] == "CANONICAL_SOURCE_MISSING"
+        assert "Egger" in issues[0]["detail"]
+
+    def test_method_cited_to_wrong_source_flagged(self):
+        from agent.canonical_sources import scan_canonical_method_usage
+        wiki = {"title": "Publication bias - Wikipedia", "snippet": "background",
+                "url": "https://en.wikipedia.org/wiki/Publication_bias"}
+        duval = {"title": "Trim and Fill: A Simple Funnel-Plot-Based Method",
+                 "doi": "10.1111/j.0006-341x.2000.00455.x", "canonical_id": "duval2000"}
+        report = ("## FINDINGS\n\nThe trim-and-fill procedure adjusted the pooled "
+                  "estimate for missing studies [S1].")
+        issues = scan_canonical_method_usage(report, [wiki, duval])
+        assert len(issues) == 1
+        assert issues[0]["type"] == "CANONICAL_METHOD_UNCITED"
+        assert "[S2]" in issues[0]["fix"]
+
+    def test_method_cited_to_canonical_passes(self):
+        from agent.canonical_sources import scan_canonical_method_usage
+        wiki = {"title": "Publication bias - Wikipedia", "snippet": "background",
+                "url": "https://en.wikipedia.org/wiki/Publication_bias"}
+        duval = {"title": "Trim and Fill: A Simple Funnel-Plot-Based Method",
+                 "doi": "10.1111/j.0006-341x.2000.00455.x", "canonical_id": "duval2000"}
+        report = ("## FINDINGS\n\nThe trim-and-fill procedure adjusted the pooled "
+                  "estimate for missing studies [S2].")
+        assert scan_canonical_method_usage(report, [wiki, duval]) == []
+
+    def test_bibliography_mentions_do_not_count(self):
+        from agent.canonical_sources import scan_canonical_method_usage
+        sources = [{"title": "Bias in meta-analysis detected by a simple, graphical test",
+                    "doi": "10.1136/bmj.315.7109.629", "canonical_id": "egger1997"}]
+        report = ("## FINDINGS\n\nPublication bias remains a threat to validity in "
+                  "small-study research designs.\n\n## SOURCES\n\n"
+                  "[S1] [P1] Egger. Bias in meta-analysis detected by a simple, graphical test. 1997.")
+        assert scan_canonical_method_usage(report, sources) == []
+
+
+class TestConceptBoundaryMismatch:
+    FL_SOURCE = {"title": "Privacy-preserving federated learning for multi-center healthcare analytics",
+                 "snippet": "Secure aggregation lets hospitals train models without sharing patient records.",
+                 "url": "https://arxiv.org/abs/1811.xxxx"}
+
+    def test_federated_source_cited_for_unpublished_trials_flagged(self):
+        from agent.citation_integrity import scan_concept_boundary_mismatch
+        report = ("## FINDINGS\n\nFederated learning frameworks enable researchers to "
+                  "access unpublished trial data held across institutions [S1].")
+        flags = scan_concept_boundary_mismatch(report, [self.FL_SOURCE])
+        assert len(flags) == 1
+        assert flags[0]["source"] == 1
+        assert "never published or registered" in flags[0]["reason"]
+
+    def test_federated_source_cited_for_its_actual_subject_passes(self):
+        from agent.citation_integrity import scan_concept_boundary_mismatch
+        report = ("## FINDINGS\n\nFederated learning supports privacy-preserving "
+                  "model training across hospitals without moving records [S1].")
+        assert scan_concept_boundary_mismatch(report, [self.FL_SOURCE]) == []
+
+    def test_unrelated_source_cited_for_unpublished_claim_passes(self):
+        from agent.citation_integrity import scan_concept_boundary_mismatch
+        src = {"title": "Publication bias: evidence of delayed publication in a cohort study",
+               "snippet": "Cohort of clinical research projects in Australia.", "url": "https://x.org"}
+        report = ("## FINDINGS\n\nA cohort study found that negative trials were "
+                  "published later or remained unpublished [S1].")
+        assert scan_concept_boundary_mismatch(report, [src]) == []
+
+
+class TestCritiqueReviseCanonicalIntegration:
+    def test_canonical_issues_enter_revision_feedback(self, monkeypatch):
+        import asyncio
+        import agent.llm_router as lr
+        import agent.research_engine as re_mod
+
+        report = ("# T\n\n## FINDINGS\n\nThe trim-and-fill procedure adjusted the "
+                  "pooled estimate [S99]. More prose here to pad the report to a "
+                  "reasonable length for the revision threshold check.\n\n## SOURCES\n\n"
+                  "[S1] [P3] Wiki. Entry. 2015.")
+
+        async def fake_router(**kwargs):
+            prompt = kwargs.get("context", "")
+            if "FLAGGED ISSUES" in prompt:
+                return SimpleNamespace(content=report.replace("[S99]", "[S1]"), model_name="mock")
+            return SimpleNamespace(content='{"issues": []}', model_name="mock")
+
+        monkeypatch.setattr(lr, "synthesize_with_router", fake_router)
+        sources = [{"title": "Wiki entry", "snippet": "x", "url": "https://en.wikipedia.org/wiki/x"}]
+        text, summary, model = asyncio.run(
+            re_mod._critique_and_revise(report, "q", sources, "quick")
+        )
+        assert "[S99]" not in text and "[S1]" in text
+        assert summary["revised"] is True
+        assert summary["canonical_issues"] == 1  # trim-and-fill named, no primary source

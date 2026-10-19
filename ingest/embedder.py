@@ -228,17 +228,21 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     Primary: Cloudflare Workers AI (free, same token as LLMs)
     Fallback: OpenAI (paid, may be region-restricted)
 
-    Args:
-        texts: List of text strings to embed
-
-    Returns:
-        List of embedding vectors
+    AUTOMATIC-FALLBACK GUARD: when the LLM router is pointed at a generic
+    OpenAI-compatible endpoint (OPENAI_BASE_URL on a non-openai.com host —
+    e.g. a local chat bridge), that endpoint is NOT known to serve
+    /embeddings. The automatic CF→OpenAI embedding fallback must not fire
+    against it (live failure: bridge chat key leaked into the embedding
+    path → 403 spam → all-zero vectors). Explicit EMBEDDING_PROVIDER=openai
+    still routes directly to the configured endpoint — that's an explicit
+    operator choice.
     """
     if EMBEDDING_PROVIDER == "cloudflare":
         result = await embed_texts_cloudflare(texts)
-        # If CF fails (all zeros), try OpenAI as fallback
+        # If CF fails (all zeros), try OpenAI as fallback — but only against
+        # the real OpenAI API, never a generic chat-bridge base URL.
         if result and all(all(v == 0.0 for v in emb) for emb in result):
-            if OPENAI_API_KEY:
+            if _automatic_openai_embed_available():
                 logger.info("CF embeddings returned zeros, trying OpenAI fallback")
                 return await embed_texts_openai(texts)
         return result
@@ -250,6 +254,13 @@ async def embed_single(text: str) -> List[float]:
     """Embed a single text string."""
     result = await embed_texts([text])
     return result[0] if result else [0.0] * EMBEDDING_DIMENSIONS
+
+
+def _automatic_openai_embed_available() -> bool:
+    """True only when the automatic OpenAI embedding fallback is legitimate:
+    a key is set AND the base URL is the real OpenAI API (or unset)."""
+    base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    return bool(OPENAI_API_KEY) and ("openai.com" in base or base == "")
 
 
 async def embed_unembedded_chunks(batch_size: int = 50) -> int:
