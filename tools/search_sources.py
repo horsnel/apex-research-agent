@@ -171,18 +171,51 @@ async def search_semantic_scholar(
         return []
 
 
+# Crossref registers figures/tables/supplementary files as "component" DOIs
+# under the parent paper (e.g. 10.7717/peerj.16381/supp-1). They are NOT
+# papers — a live run cited "Supplemental Information 1: Meta-bias analysis
+# results" (a coral-reef paper's supplement) as meta-analysis methodology.
+NON_PAPER_CROSSREF_TYPES = {
+    "component", "report-component", "dataset-component", "component-abstract",
+    "abstract", "abstract-registered", "proceedings-abstract",
+    "proceedings-abstract-inproceedings", "paralipomena", "book-track",
+    "standard", "erratum", "corrigendum", "retraction", "letter",
+}
+_COMPONENT_DOI_RE = re.compile(r"/(?:supp|supplementary|appendix|fig|figure|table|scheme|equation|media|dataset|code|checklist|peer-review|formula)s?-?\d", re.I)
+_JUNK_CROSSREF_TITLE_RE = re.compile(
+    r"^(supplemental information|supplementary (material|information|file|table|figure)|"
+    r"supplementary|table s?\d|figure s?\d|appendix [a-z0-9]|supporting information)\b",
+    re.I,
+)
+
+
+def _is_crossref_paper(item: dict) -> bool:
+    """True when a Crossref record is an actual citable paper, not a
+    component DOI (figure/table/supplement) or junk metadata record."""
+    doi = (item.get("DOI") or "").lower()
+    if (item.get("type") or "").lower() in NON_PAPER_CROSSREF_TYPES:
+        return False
+    if _COMPONENT_DOI_RE.search(doi):
+        return False
+    title_list = item.get("title") or []
+    title = title_list[0] if title_list else ""
+    if title and _JUNK_CROSSREF_TITLE_RE.search(title.strip()):
+        return False
+    return True
+
+
 async def search_crossref(
     query: str,
     max_results: int = DEFAULT_MAX_RESULTS,
 ) -> List[SearchResult]:
     """
     Search Crossref — the official DOI registry with 140M+ records.
-    
+
     Free: Polite pool (with mailto) gets priority routing.
     Covers: Journal articles, books, conference proceedings, preprints.
     Returns: DOIs, citation counts, license info, full metadata.
-    
-    Best for: DOI verification, citation tracking, finding official 
+
+    Best for: DOI verification, citation tracking, finding official
     publication metadata and licensing.
     """
     try:
@@ -198,9 +231,14 @@ async def search_crossref(
             )
             r.raise_for_status()
             data = r.json()
-        
+
         results = []
         for item in data.get("message", {}).get("items", []):
+            # Skip component DOIs (figures/tables/supplements) and junk
+            # records — they carry the parent paper's keywords and sail
+            # through relevance gates, then get cited as fake methodology.
+            if not _is_crossref_paper(item):
+                continue
             authors = []
             for a in item.get("author", []):
                 name = f"{a.get('given', '')} {a.get('family', '')}".strip()

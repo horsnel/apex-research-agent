@@ -257,7 +257,15 @@ async def _semantic_scores(query: str, texts: List[str]) -> Optional[List[float]
             return dot / (na * nb)
 
         q_emb = embeddings[0]
-        return [_cosine(q_emb, e) for e in embeddings[1:]]
+        scores = [_cosine(q_emb, e) for e in embeddings[1:]]
+        # Degenerate embedding output (provider outage returns zero vectors —
+        # live-seen during a Cloudflare neuron-quota outage) would rank chunks
+        # arbitrarily while claiming semantic validity. Detect and fall back
+        # to honest keyword scoring instead.
+        if all(s <= 1e-9 for s in scores):
+            logger.info("Semantic scores degenerate (zero vectors) — falling back to keyword scoring")
+            return None
+        return scores
     except Exception as e:
         logger.debug(f"Semantic evidence scoring unavailable ({e}); using keyword scores")
         return None

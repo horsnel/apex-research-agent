@@ -327,6 +327,45 @@ def _source_relevance(source: Dict, query_vocab: set) -> float:
     return shared / len(query_vocab)
 
 
+# ── Junk-source detection (defense-in-depth behind provider filters) ──
+# Live failure: Crossref component DOIs ("Supplemental Information 1: ...",
+# figure/table records) carry the parent paper's keywords, pass lexical
+# relevance gates, and get cited as methodology for unrelated claims.
+_JUNK_SOURCE_TITLE_RE = re.compile(
+    r"^(supplemental information|supplementary (material|information|file|table|figure)|"
+    r"table s?\d|figure s?\d|appendix [a-z0-9]|supporting information|"
+    r"front matter|back matter|cover image|table of contents)\b",
+    re.I,
+)
+_ENCYCLOPEDIA_DOMAINS = {"wikipedia.org", "britannica.com", "dbpedia.org", "wikidata.org"}
+# A URL whose final path segment is one of these is a directory listing,
+# not a citable resource (live case: https://huggingface.co/papers/ with no
+# paper ID). Conservative set — only bare section words, nothing else.
+_BARE_SECTION_SEGMENTS = {
+    "papers", "pubs", "publications", "articles", "issues", "abstracts",
+    "docs", "blog", "news", "search", "topics", "categories", "collections",
+    "datasets", "models", "journals", "books", "reports", "publications",
+}
+
+
+def _is_junk_source(source: Dict) -> bool:
+    """Non-paper artifacts no report should cite: supplementary-file records
+    and URLs that point at a bare directory/section root."""
+    title = (source.get("title") or "").strip()
+    if title and _JUNK_SOURCE_TITLE_RE.match(title):
+        return True
+    url = (source.get("url") or "").strip()
+    m = re.match(r"^[a-z]+://[^/]+(/.*)?$", url)
+    if m:
+        path = (m.group(1) or "").strip("/")
+        if not path:
+            return True  # bare domain, no resource at all
+        last = path.rsplit("/", 1)[-1].strip().lower()
+        if last in _BARE_SECTION_SEGMENTS:
+            return True
+    return False
+
+
 def select_diverse_sources(
     sources: List[Dict],
     max_sources: int = 25,
@@ -376,6 +415,15 @@ def select_diverse_sources(
     for s in sources:
         s["tier"] = enforce_source_tier(s.get("url", ""), s.get("tier", "UNV"))
 
+    # ── Pass -1: junk filter — non-paper artifacts never enter selection ──
+    pre_junk = len(sources)
+    sources = [s for s in sources if not _is_junk_source(s)]
+    if len(sources) < pre_junk:
+        logger.info(
+            f"Junk filter: dropped {pre_junk - len(sources)} non-paper sources "
+            f"(supplement/figure records, bare-directory URLs)"
+        )
+
     # ── Pass 0: relevance gate ──
     dropped_irrelevant = 0
     if query:
@@ -416,11 +464,23 @@ def select_diverse_sources(
     def _base_domain(s: Dict) -> str:
         return _extract_domain(s.get("url", "")) or "unknown"
 
-    # Pass 1: score-ordered walk with per-domain caps
+    def _is_encyclopedia(s: Dict) -> bool:
+        dom = _base_domain(s)
+        return any(dom == e or dom.endswith("." + e) for e in _ENCYCLOPEDIA_DOMAINS)
+
+    # Pass 1: score-ordered walk with per-domain caps + encyclopedia cap.
+    # Encyclopedias support background only — at most ONE per report so the
+    # technical claims are anchored in primary literature.
     deferred: List[Dict] = []
+    encyclopedia_used = 0
     for s in ranked:
         if len(selected) >= max_sources:
             break
+        if _is_encyclopedia(s):
+            if encyclopedia_used >= 1:
+                deferred.append(s)
+                continue
+            encyclopedia_used += 1
         dom = _base_domain(s)
         if domain_counts.get(dom, 0) >= per_domain_cap:
             deferred.append(s)
@@ -443,11 +503,12 @@ def select_diverse_sources(
             domain_counts[dom] = domain_counts.get(dom, 0) + 1
             p2_count += 1
 
-    # Pass 3: fill remaining slots from deferred (domain-capped) sources
+    # Pass 3: fill remaining slots from deferred (domain-capped) sources —
+    # but never re-admit encyclopedia sources (cap is one, taken in Pass 1)
     for s in deferred:
         if len(selected) >= max_sources:
             break
-        if s in selected:
+        if s in selected or _is_encyclopedia(s):
             continue
         dom = _base_domain(s)
         if domain_counts.get(dom, 0) >= per_domain_cap:
@@ -1211,7 +1272,13 @@ STYLE:
 - Substantial prose (not bare bullets) with tables where comparisons arise.
 - No preamble, no "In conclusion", no filler transitions.
 - Write ONLY the requested section — no other sections, no report title.
-- Use ## for the section heading exactly as given."""
+- Use ## for the section heading exactly as given.
+
+CLAIM-SOURCE FIDELITY (NON-NEGOTIABLE):
+- Before attaching [Sn] to a sentence, verify that source actually supports THAT claim — not merely a related topic.
+- If the source addresses a related-but-different problem (e.g. accumulation bias ≠ publication bias; workflow automation ≠ making inaccessible data accessible), NEVER present it as solving the claim's problem. Restate the claim to what the source actually supports, or drop the citation and mark the sentence [UNVERIFIED].
+- Encyclopedias may support background definitions only — never named methods, statistical procedures, or empirical results.
+- Describe each source's actual scope; do not inflate its contribution to fit your narrative."""
 
 
 CRITIQUE_SYSTEM_PROMPT = """You are a hostile peer reviewer for a research report.
@@ -1222,6 +1289,10 @@ Given the report and its numbered source list, identify ONLY these defect types:
 3. UNSUPPORTED_SUPERLATIVE: sweeping claims ("most", "best", "proves") without evidence
 4. STALE_EVIDENCE: claims resting on clearly outdated sources when newer ones exist
 5. FRAMING_MISMATCH: the title or section structure promises an analysis the cited evidence cannot deliver (e.g. claims to study X directly when the evidence only supports an indirect estimate related to X) — the fix is a reframing instruction, never invented evidence
+6. CLAIM_SOURCE_MISMATCH: a citation attached to a claim about a DIFFERENT problem than the source addresses — e.g. a source about accumulation bias (type-I error from repeatedly updating a meta-analysis) cited as if it addressed publication bias (unpublished studies); a workflow-automation tool cited as making inaccessible data accessible. The fix MUST restate the claim to what the source actually supports, or drop the claim
+7. ENCYCLOPEDIA_CITATION: a named method, statistical procedure, or empirical result cited to an encyclopedia — fix: keep encyclopedias for background definitions only; attribute methods/results to primary literature or mark [UNVERIFIED]
+
+Pay special attention to MECHANICALLY FLAGGED PAIRS if present — they are deterministic suspects for type 1/6.
 
 Return ONLY valid JSON:
 {"issues": [{"section_heading": "...", "type": "...", "detail": "...", "fix": "specific instruction"}]}
@@ -1594,14 +1665,16 @@ async def _critique_and_revise(
     Returns (final_text, critique_summary_dict, model_used).
     """
     from agent.llm_router import synthesize_with_router
-    from agent.citation_integrity import check_report_citations
+    from agent.citation_integrity import check_report_citations, scan_claim_source_alignment
 
     citation_report = check_report_citations(report_text, sources)
+    alignment_flags = scan_claim_source_alignment(report_text, sources)
     critique_summary = {
         "citation_precision": citation_report.citation_precision,
         "claim_coverage": citation_report.claim_coverage,
         "invalid_citations": citation_report.invalid_citations,
         "uncited_claims": len(report_text and citation_report.uncited_claim_sentences or []),
+        "alignment_flags": len(alignment_flags),
         "llm_issues": 0,
         "revised": False,
     }
@@ -1614,12 +1687,21 @@ async def _critique_and_revise(
             f"[S{i}] {(s.get('title') or 'Untitled')[:100]}: {(s.get('snippet') or '')[:300]}"
             for i, s in enumerate(sources, 1)
         )
+        alignment_blob = ""
+        if alignment_flags:
+            pairs = "\n".join(
+                f"  - [S{f['source']}] ← “{f['excerpt']}”" for f in alignment_flags
+            )
+            alignment_blob = (
+                "\nMECHANICALLY FLAGGED PAIRS (cited source shares no content words "
+                "with the claim — verify against the source list first):\n" + pairs + "\n"
+            )
         critique_prompt = f"""REPORT TO REVIEW (may be truncated):
 {report_text[:14000]}
 
 SOURCE LIST:
 {sources_blob}
-
+{alignment_blob}
 Find the worst hallucinated citations, missing citations, and unsupported superlatives. Return ONLY the JSON."""
         result = await synthesize_with_router(
             query="critique report",

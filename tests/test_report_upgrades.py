@@ -662,3 +662,151 @@ class TestOpenAICompatProvider:
         from agent.llm_router import select_tier
         models = select_tier(task_type="classification")
         assert all(m.tier in ("cheap", "free") for m in models)
+
+
+class TestCrossrefComponentFilter:
+    """Root fix for the live [S4] failure: Crossref registers figures/tables/
+    supplementary files as 'component' DOIs under the parent paper. They carry
+    the parent's keywords, pass relevance gates, and got cited as methodology
+    ("Supplemental Information 1: Meta-bias analysis results" = a coral-reef
+    paper's supplement). They must never become sources."""
+
+    def _item(self, **kw):
+        base = {"DOI": "10.7717/peerj.16381", "type": "journal-article",
+                "title": ["Real paper title"], "author": []}
+        base.update(kw)
+        return base
+
+    def test_real_article_passes(self):
+        from tools.search_sources import _is_crossref_paper
+        assert _is_crossref_paper(self._item())
+
+    def test_component_type_rejected(self):
+        from tools.search_sources import _is_crossref_paper
+        assert not _is_crossref_paper(self._item(type="component"))
+
+    def test_component_doi_suffix_rejected(self):
+        from tools.search_sources import _is_crossref_paper
+        for doi in ("10.7717/peerj.16381/supp-1", "10.7717/peerj.5172/supp-23",
+                    "10.7717/peerjcs.1714/fig-6", "10.7717/peerjcs.1714/table-2"):
+            assert not _is_crossref_paper(self._item(DOI=doi)), doi
+
+    def test_supplement_title_rejected(self):
+        from tools.search_sources import _is_crossref_paper
+        for title in ("Supplemental Information 1: Meta-bias analysis results.",
+                      "Table S2: Characteristics of unpublished trials",
+                      "Figure 6: Result analysis of some method"):
+            assert not _is_crossref_paper(self._item(title=[title])), title
+
+
+class TestSelectionJunkAndEncyclopedia:
+    """Defense-in-depth at selection: junk records and bare-directory URLs
+    never enter the report; encyclopedias are capped at one source."""
+
+    def _src(self, i, title="Legit study", url="https://journal.example/a",
+             snippet="unpublished negative-result trials meta-analysis"):
+        return {"url": url, "title": title, "tier": "P1", "snippet": snippet}
+
+    def _sel(self, sources):
+        from agent.research_engine import select_diverse_sources
+        return select_diverse_sources(
+            sources, max_sources=10, query="unpublished negative-result trials meta-analysis",
+            query_variants=[], min_relevance=0.05,
+        )
+
+    def test_supplement_record_dropped(self):
+        junk = self._src(1, title="Supplemental Information 1: Meta-bias analysis results.",
+                         url="https://doi.org/10.7717/peerj.16381/supp-1")
+        out = self._sel([junk, self._src(2)])
+        assert all("Supplemental" not in (s.get("title") or "") for s in out)
+
+    def test_bare_directory_url_dropped(self):
+        junk = self._src(1, title="Manalyzer: automated meta-analysis",
+                         url="https://huggingface.co/papers/")
+        out = self._sel([junk, self._src(2)])
+        assert all(s.get("url") != "https://huggingface.co/papers/" for s in out)
+
+    def test_encyclopedia_capped_at_one(self):
+        wikis = [self._src(i, title=f"Meta-analysis overview {i}",
+                           url=f"https://en.wikipedia.org/wiki/Meta-analysis_{i}")
+                 for i in range(3)]
+        out = self._sel(wikis)
+        wiki_count = sum(1 for s in out if "wikipedia.org" in (s.get("url") or ""))
+        assert wiki_count <= 1
+
+    def test_legit_sources_survive(self):
+        out = self._sel([self._src(1), self._src(2)])
+        assert len(out) == 2
+
+
+class TestClaimSourceAlignment:
+    """Deterministic claim↔source alignment scan: a cited source sharing zero
+    content words with the claim sentence is flagged for critique."""
+
+    def test_zero_overlap_flagged(self):
+        from agent.citation_integrity import scan_claim_source_alignment
+        srcs = [
+            {"url": "https://a.example/1", "title": "ALL-IN meta-analysis framework",
+             "snippet": "anytime-valid confidence intervals for prospective evidence synthesis"},
+            {"url": "https://coral.example/2", "title": "Sponge-host interaction networks",
+             "snippet": "coral reef ecosystems host diverse sponge communities in tropical waters"},
+        ]
+        text = ("Statistical tests such as Egger's regression and trim-and-fill "
+                "estimate missing studies [S2].\n\n## SOURCES\n[S1] x\n[S2] y")
+        flags = scan_claim_source_alignment(text, srcs)
+        assert any(f["source"] == 2 for f in flags)
+
+    def test_supported_claim_not_flagged(self):
+        from agent.citation_integrity import scan_claim_source_alignment
+        srcs = [{"url": "https://a.example/1", "title": "ALL-IN meta-analysis framework",
+                 "snippet": "anytime-valid confidence intervals for prospective and retrospective meta-analysis"}]
+        text = ("The ALL-IN framework maintains validity for prospective meta-analysis "
+                "using anytime-valid confidence intervals [S1].\n\n## SOURCES\n[S1] x")
+        assert scan_claim_source_alignment(text, srcs) == []
+
+    def test_doi_only_snippet_skipped(self):
+        from agent.citation_integrity import scan_claim_source_alignment
+        srcs = [{"url": "https://doi.org/10.7717/peerj.16381/supp-1",
+                 "title": "Supplemental Information 1: Meta-bias analysis results.",
+                 "snippet": "DOI: 10.7717/peerj.16381/supp-1"}]
+        text = ("Methods include funnel plots and Egger's regression for bias "
+                "detection in synthesized estimates [S1].\n\n## SOURCES\n[S1] x")
+        # DOI-only snippet carries no checkable content — no false positive
+        assert scan_claim_source_alignment(text, srcs) == []
+
+
+class TestDegenerateSemanticFallback:
+    """Embedding-provider outages return zero vectors, which cosine-scoring
+    turns into all-zero (arbitrary) chunk rankings. The evidence retriever
+    must detect this and fall back to keyword scoring instead."""
+
+    def test_zero_vectors_return_none(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        async def fake_embed(texts):
+            return [[0.0] * 8 for _ in texts]
+
+        import ingest.embedder as emb
+        monkeypatch.setattr(emb, "embed_texts", fake_embed)
+        out = asyncio.run(ef._semantic_scores("query about trials", ["chunk one", "chunk two"]))
+        assert out is None
+
+    def test_real_vectors_return_scores(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+        import math
+
+        q = [1.0, 0.0, 0.0, 0.0]
+
+        async def fake_embed(texts):
+            vecs = [q]
+            for t in texts[1:] if False else texts:
+                pass
+            # first is the query, rest mirror varying overlap with query
+            return [q, [0.9, 0.1, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0]]
+
+        import ingest.embedder as emb
+        monkeypatch.setattr(emb, "embed_texts", fake_embed)
+        out = asyncio.run(ef._semantic_scores("query", ["a", "b"]))
+        assert out is not None and len(out) == 2
+        assert out[0] > out[1]
+        assert not all(abs(s) <= 1e-9 for s in out)

@@ -255,3 +255,84 @@ def rebuild_bibliography(report_text: str, sources: List[Dict]) -> str:
     if not m:
         return report_text.rstrip() + canonical
     return report_text[:m.start()] + canonical
+
+
+# ── Claim↔source alignment scan ─────────────────────────────────────
+# Live failure: "Egger's regression / trim-and-fill [S4]" cited a marine-
+# ecology supplement whose snippet was just a DOI string. Citation NUMBERS
+# were valid (precision 1.0) — but the source did not support the claim.
+# This scan is the deterministic first-order detector: a cited source that
+# shares ZERO content words with the claim sentence is flagged for the
+# critique LLM to adjudicate (snippets can be terse even when support is real).
+
+_ALIGNMENT_STOPWORDS = {
+    "this", "that", "these", "those", "with", "from", "have", "has", "had",
+    "been", "were", "their", "them", "they", "which", "while", "when", "where",
+    "such", "also", "more", "most", "than", "then", "into", "over", "under",
+    "between", "among", "both", "each", "other", "some", "only", "very",
+    "can", "may", "will", "would", "could", "should", "must", "shall",
+    "there", "here", "thus", "hence", "however", "although", "because",
+    "about", "after", "before", "during", "through", "across", "against",
+    "within", "without", "upon", "does", "done", "using", "used", "based",
+    "study", "studies", "research", "analysis", "results", "result",
+    "paper", "report", "section", "table", "figure", "approach", "method",
+    "methods", "data", "evidence", "findings", "finding", "shows", "shown",
+    "including", "include", "includes", "provide", "provides", "given",
+}
+
+
+def _alignment_content_words(text: str) -> set:
+    """Content words for alignment (len>=4, stopwords removed)."""
+    words = re.findall(r"[a-z0-9]{4,}", (text or "").lower())
+    return {w for w in words if w not in _ALIGNMENT_STOPWORDS}
+
+
+def scan_claim_source_alignment(
+    report_text: str,
+    sources: List[Dict],
+    max_flags: int = 8,
+) -> List[Dict]:
+    """
+    Deterministic claim↔source alignment check.
+
+    For each sentence carrying a numbered citation, compute the shared
+    content-word set between the sentence and each cited source's
+    title+snippet. A cited source with ZERO shared content words is flagged
+    as a suspected mis-attribution for the critique pass to verify.
+
+    Returns a list of flags:
+        {"source": n, "excerpt": "<sentence up to 160 chars>"}
+    """
+    flags: List[Dict] = []
+
+    main_text = report_text
+    bib_match = re.search(r'\n##\s*SOURCES\b.*\Z', report_text, re.DOTALL | re.IGNORECASE)
+    if bib_match:
+        main_text = report_text[:bib_match.start()]
+
+    # Drop markdown tables and headings — alignment only applies to prose
+    lines = [ln for ln in main_text.split("\n") if not ln.strip().startswith(("#", "|"))]
+    prose = "\n".join(lines)
+    sentences = re.split(r"(?<=[.!?])\s+", prose)
+
+    for sentence in sentences:
+        if len(sentence.split()) < 8 or len(flags) >= max_flags:
+            continue
+        cited = sorted({n for n in extract_numbered_citations(sentence) if 1 <= n <= len(sources)})
+        if not cited:
+            continue
+        sent_words = _alignment_content_words(sentence)
+        if not sent_words:
+            continue
+        for n in cited:
+            src = sources[n - 1]
+            src_text = f"{src.get('title') or ''} {src.get('snippet') or ''}"
+            # A snippet that is only a DOI/URL carries no checkable content —
+            # skip rather than false-positive on terse metadata.
+            if len(re.sub(r"(doi|https?://\S+|[\s.:])", "", src_text.lower())) < 25:
+                continue
+            if not (sent_words & _alignment_content_words(src_text)):
+                flags.append({"source": n, "excerpt": sentence.strip()[:160]})
+                break  # one flag per sentence is enough for adjudication
+
+    return flags
