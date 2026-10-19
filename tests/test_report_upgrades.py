@@ -1154,3 +1154,589 @@ class TestCritiqueReviseCanonicalIntegration:
         assert "[S99]" not in text and "[S1]" in text
         assert summary["revised"] is True
         assert summary["canonical_issues"] == 1  # trim-and-fill named, no primary source
+
+
+# ═══════════════════════════════════════════════════════════════
+# WEB / GREY-LITERATURE RETRIEVAL (z-ai bridge provider)
+# ═══════════════════════════════════════════════════════════════
+
+from tools.search_sources import (  # noqa: E402
+    SearchResult,
+    SourceCategory,
+    search_zai_web,
+    fetch_page_text,
+    canonicalize_web_url,
+    _web_result_tier,
+    _web_date_to_iso,
+    _relaxed_page_text,
+)
+from agent.research_engine import _web_sources_for_report  # noqa: E402
+from agent.evidence_fetcher import fetch_source_fulltext  # noqa: E402
+
+
+def _web_row(url, name="A title", snippet="some snippet", date=None, host=None):
+    return {"url": url, "name": name, "snippet": snippet, "date": date,
+            "host_name": host or "", "rank": 0, "favicon": ""}
+
+
+class TestWebUrlCanonicalization:
+    def test_strips_tracking_fragment_and_trailing_slash(self):
+        out = canonicalize_web_url(
+            "https://WWW.Example.com/post/?utm_source=x&utm_campaign=y&id=7&fbclid=Z#top/"
+        )
+        assert out == "https://www.example.com/post?id=7"
+
+    def test_keeps_meaningful_query_and_path(self):
+        out = canonicalize_web_url("https://api.site.org/search?q=trials&page=2")
+        assert out == "https://api.site.org/search?q=trials&page=2"
+
+    def test_garbage_and_empty(self):
+        assert canonicalize_web_url("") == ""
+        assert canonicalize_web_url("not a url") == "not a url"
+
+
+class TestWebDateParsing:
+    def test_search_engine_date(self):
+        assert _web_date_to_iso("Feb 6, 2024 — A total of 475 trials") == "2024-02-06"
+
+    def test_bare_year_fallback(self):
+        assert _web_date_to_iso("Published 2025 by someone") == "2025"
+
+    def test_garbage_and_empty(self):
+        assert _web_date_to_iso("no date here") is None
+        assert _web_date_to_iso("") is None
+        assert _web_date_to_iso(None) is None
+
+
+class TestWebResultGovernance:
+    def test_grey_literature_ngos_are_p2(self):
+        assert _web_result_tier("https://www.transparimed.org/single-post/nordic-trials") == "P2"
+        assert _web_result_tier("https://senseaboutscience.org/activities/nordic-trial-report") == "P2"
+        assert _web_result_tier("https://www.cochrane.org/news/hundreds-nordic-trials") == "P2"
+
+    def test_institutional_suffixes_are_p2(self):
+        assert _web_result_tier("https://www.nih.gov/news-events") == "P2"
+        assert _web_result_tier("https://health.ec.europa.eu/report") == "P2"
+
+    def test_unknown_open_web_is_p3(self):
+        assert _web_result_tier("https://www.bmj.com/content/384/bmj.q343") == "P3"
+
+    def test_social_and_junk_tlds_dropped(self):
+        assert _web_result_tier("https://x.com/TranspariMED/status/175477") == "DROP"
+        assert _web_result_tier("https://medium.com/@someone/post") == "DROP"
+        assert _web_result_tier("https://spamblog.xyz/post") == "DROP"
+
+    def test_subdomains_inherit_governance(self):
+        assert _web_result_tier("https://eu.trialstracker.net/sponsor/rigshospitalet") == "P2"
+
+    def test_bare_host_dropped(self):
+        assert _web_result_tier("http://localhost:9999/x") == "DROP"
+
+
+class TestSearchZaiWeb:
+    def test_shapes_rows_and_applies_governance(self, monkeypatch):
+        import tools.search_sources as ts
+
+        rows = [
+            _web_row("https://www.transparimed.org/single-post/nordic-trials?utm_source=rss",
+                     name="Nordic countries: 475 clinical trials",
+                     snippet="475 trials never made public",
+                     date="Feb 6, 2024"),
+            _web_row("https://x.com/TranspariMED/status/175477538", name="Tweet about it"),
+            _web_row("https://www.transparimed.org/single-post/nordic-trials",
+                     name="dup canonicalized"),
+            _web_row("https://unknown-site.org/analysis", name="Some analysis"),
+            _web_row("https://notitle.example.com/x", name=""),
+        ]
+
+        async def fake_bridge(path, payload, timeout=None):
+            assert path == "/web_search"
+            return rows
+
+        monkeypatch.setattr(ts, "_bridge_request", fake_bridge)
+        out = asyncio.run(search_zai_web("nordic trials", 8))
+        assert len(out) == 2
+        first = out[0]
+        assert first.url == "https://www.transparimed.org/single-post/nordic-trials"
+        assert first.source_tier == "P2"
+        assert first.source_name == "zai_web"
+        assert first.source_category == SourceCategory.WEB
+        assert first.published_date == "2024-02-06"
+        assert first.extra["web"] is True
+        assert out[1].source_tier == "P3"
+
+    def test_bridge_failure_returns_empty(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead_bridge(path, payload, timeout=None):
+            raise ConnectionError("bridge down")
+
+        monkeypatch.setattr(ts, "_bridge_request", dead_bridge)
+        assert asyncio.run(search_zai_web("anything")) == []
+
+    def test_empty_query_short_circuits(self, monkeypatch):
+        import tools.search_sources as ts
+
+        called = {"n": 0}
+
+        async def no_call(path, payload, timeout=None):
+            called["n"] += 1
+            return []
+
+        monkeypatch.setattr(ts, "_bridge_request", no_call)
+        assert asyncio.run(search_zai_web("   ")) == []
+        assert called["n"] == 0
+
+
+_WIXISH_HTML = (
+    "<html><head><style>body { color: red; }</style>"
+    "<script>var tracker = 1;</script></head><body>"
+    "<nav><a href='/'>Home</a><a href='/x'>X</a></nav>"
+    "<div class='header shadow gradient'><h1>Nordic countries: 475 clinical "
+    "trials involving 83,903 patients are missing results</h1>"
+    "<p>A total of 475 clinical trials completed in Denmark, Iceland, Finland, "
+    "Norway and Sweden have never made their results public in any form.</p>"
+    "<p>Only 27 percent of all trial results were made public within 12 months "
+    "of trial completion, the report found.</p></div>"
+    "<footer>cookie banner subscribe newsletter</footer>"
+    "</body></html>"
+)
+
+
+class TestFetchPageText:
+    def test_extracts_text_from_sdk_envelope(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def fake_bridge(path, payload, timeout=None):
+            assert path == "/page_reader"
+            assert payload["url"].startswith("https://www.transparimed.org/")
+            return {"code": 200, "status": 200,
+                    "data": {"html": _WIXISH_HTML, "title": "Nordic trials", "url": payload["url"]}}
+
+        monkeypatch.setattr(ts, "_bridge_request", fake_bridge)
+        text = asyncio.run(fetch_page_text("https://www.transparimed.org/single-post/nordic-trials"))
+        assert "475 clinical trials" in text
+        assert "tracker" not in text and "cookie banner" not in text
+
+    def test_relaxed_extraction_rescues_overcleaned_pages(self):
+        # clean_html's aggressive ad-class patterns decompose class="header ..."
+        # containers; the relaxed pass must recover the story text.
+        from ingest.html_cleaner import clean_html
+
+        assert clean_html(_WIXISH_HTML).strip() == "" or "475" not in clean_html(_WIXISH_HTML)
+        relaxed = _relaxed_page_text(_WIXISH_HTML)
+        assert "475 clinical trials" in relaxed
+        assert "27 percent" in relaxed
+        assert "var tracker" not in relaxed
+
+    def test_too_small_html_returns_empty(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def fake_bridge(path, payload, timeout=None):
+            return {"data": {"html": "<html><body>hi</body></html>"}}
+
+        monkeypatch.setattr(ts, "_bridge_request", fake_bridge)
+        assert asyncio.run(fetch_page_text("https://x.org/page")) == ""
+
+    def test_bridge_failure_returns_empty(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead(path, payload, timeout=None):
+            raise ConnectionError("down")
+
+        monkeypatch.setattr(ts, "_bridge_request", dead)
+        assert asyncio.run(fetch_page_text("https://x.org/page")) == ""
+
+
+class TestWebSourcesForReport:
+    def _fake_results(self):
+        return [
+            SearchResult(
+                title="Nordic countries: 475 clinical trials",
+                url="https://www.transparimed.org/single-post/nordic-trials",
+                snippet="475 trials never made results public",
+                source_name="zai_web",
+                source_category=SourceCategory.WEB,
+                source_tier="P2",
+                published_date="2024-02-06",
+                extra={"web": True, "host": "transparimed.org"},
+            ),
+            SearchResult(
+                title="Missing and delayed results reporting",
+                url="https://pubmed.ncbi.nlm.nih.gov/39900256",
+                snippet="Systematic evaluation of timely reporting",
+                source_name="zai_web",
+                source_category=SourceCategory.WEB,
+                source_tier="P2",
+            ),
+        ]
+
+    def test_dict_shape_tier_enforcement_and_budget(self, monkeypatch):
+        import tools.search_sources as ts
+
+        seen_queries = []
+
+        async def fake_search(query, num):
+            seen_queries.append(query)
+            return self._fake_results()
+
+        monkeypatch.setattr(ts, "search_zai_web", fake_search)
+        topic = "Meta-analysis of unpublished negative-result trials that never made it into public databases."
+        sources, stats = asyncio.run(
+            _web_sources_for_report(topic, ["variant one", "variant two"], "quick")
+        )
+        # quick budget: primary + deterministic keyword rewrite (no variants)
+        assert len(seen_queries) == 2
+        assert stats["queries"][0] == topic
+        assert stats["queries"][1] == "Meta-analysis unpublished negative-result trials databases"
+        assert stats["available"] is True and stats["inserted"] == 2
+        by_url = {s["url"]: s for s in sources}
+        transparimed = by_url["https://www.transparimed.org/single-post/nordic-trials"]
+        assert transparimed["category"] == "web"
+        assert transparimed["tier"] == "P2"
+        assert transparimed["extra"]["web"] is True
+        # pubmed.ncbi.nlm.nih.gov is in the global P1 domain map
+        assert by_url["https://pubmed.ncbi.nlm.nih.gov/39900256"]["tier"] == "P1"
+
+    def test_thorough_depth_uses_rewrite_plus_two_variants(self, monkeypatch):
+        import tools.search_sources as ts
+
+        seen_queries = []
+
+        async def fake_search(query, num):
+            seen_queries.append(query)
+            return []
+
+        monkeypatch.setattr(ts, "search_zai_web", fake_search)
+        _sources, stats = asyncio.run(
+            _web_sources_for_report("q words", ["v1", "v2", "v3"], "thorough")
+        )
+        # thorough budget: primary + rewrite + 2 genuinely-new variants
+        assert len(seen_queries) == 4
+        assert seen_queries[2] == "v1" and seen_queries[3] == "v2"
+        assert stats["results"] == 0 and stats["available"] is False
+
+    def test_env_gate_off(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def no_call(query, num):
+            raise AssertionError("must not be called")
+
+        monkeypatch.setattr(ts, "search_zai_web", no_call)
+        monkeypatch.setenv("APEX_WEB_SEARCH", "0")
+        sources, stats = asyncio.run(_web_sources_for_report("q", ["v"], "quick"))
+        assert sources == [] and stats["enabled"] is False
+
+    def test_bridge_down_degrades_honestly(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead(query, num):
+            raise ConnectionError("bridge down")
+
+        monkeypatch.setattr(ts, "search_zai_web", dead)
+        sources, stats = asyncio.run(_web_sources_for_report("q", ["v"], "quick"))
+        assert sources == []
+        assert stats["available"] is False and stats["enabled"] is True
+
+
+class TestEvidenceWebDispatch:
+    def test_web_record_routes_to_page_reader(self, monkeypatch):
+        import tools.search_sources as ts
+
+        called = {"page_reader": 0, "scrape": 0}
+
+        async def fake_page_text(url, max_chars=120_000):
+            called["page_reader"] += 1
+            return "Real grey-literature report text. " * 40
+
+        async def fake_scrape(url):
+            called["scrape"] += 1
+            raise AssertionError("scrape must not run when page_reader succeeds")
+
+        monkeypatch.setattr(ts, "fetch_page_text", fake_page_text)
+        import tools.live_scraper as ls
+        monkeypatch.setattr(ls, "_scrape_url_with_fallback", fake_scrape)
+
+        source = {"url": "https://www.transparimed.org/single-post/nordic-trials",
+                  "source_name": "zai_web", "extra": {"web": True}}
+        text = asyncio.run(fetch_source_fulltext(source))
+        assert called["page_reader"] == 1
+        assert len(text) > 500
+
+    def test_non_web_record_skips_page_reader(self, monkeypatch):
+        import tools.search_sources as ts
+        import tools.live_scraper as ls
+
+        async def fake_page_text(url, max_chars=120_000):
+            raise AssertionError("page_reader must not run for academic records")
+
+        async def fake_scrape(url):
+            from types import SimpleNamespace
+            return SimpleNamespace(url=url, markdown="", success=False, error="offline")
+
+        monkeypatch.setattr(ts, "fetch_page_text", fake_page_text)
+        monkeypatch.setattr(ls, "_scrape_url_with_fallback", fake_scrape)
+
+        source = {"url": "https://arxiv.org/abs/2411.10971", "source_name": "arxiv"}
+        assert asyncio.run(fetch_source_fulltext(source)) == ""
+
+    def test_web_record_falls_back_to_scrape(self, monkeypatch):
+        import tools.search_sources as ts
+        import tools.live_scraper as ls
+
+        async def empty_page_text(url, max_chars=120_000):
+            return ""
+
+        async def fake_scrape(url):
+            from types import SimpleNamespace
+            return SimpleNamespace(url=url, markdown="Scraped fallback text. " * 40,
+                                   success=True, error="")
+
+        monkeypatch.setattr(ts, "fetch_page_text", empty_page_text)
+        monkeypatch.setattr(ls, "_scrape_url_with_fallback", fake_scrape)
+
+        source = {"url": "https://senseaboutscience.org/report.pdf",
+                  "source_name": "zai_web", "extra": {"web": True}}
+        text = asyncio.run(fetch_source_fulltext(source))
+        assert text.startswith("Scraped fallback")
+
+
+class TestWebBibliographyAndDedup:
+    def test_bibliography_renders_web_record(self):
+        sources = [{
+            "title": "Nordic countries: 475 clinical trials involving 83,903 patients are missing results",
+            "url": "https://www.transparimed.org/single-post/nordic-trials",
+            "snippet": "475 trials never made public",
+            "tier": "P2",
+            "published_date": "2024-02-06",
+            "source_name": "zai_web",
+            "category": "web",
+        }]
+        bib = build_sources_section(sources)
+        assert "[S1] [P2]" in bib
+        assert "475 clinical trials" in bib
+        assert "2024." in bib
+        assert "https://www.transparimed.org/single-post/nordic-trials" in bib
+
+    def test_web_record_merges_with_academic_twin(self):
+        web = {
+            "title": "Nordic countries: 475 clinical trials involving 83,903 patients are missing results",
+            "url": "https://www.transparimed.org/single-post/nordic-trials",
+            "snippet": "A total of 475 clinical trials completed in Denmark, Iceland, Finland, Norway and Sweden have never made their results public in any form, 83,903 participants.",
+            "tier": "P2",
+            "source_name": "zai_web",
+            "category": "web",
+        }
+        academic = {
+            "title": "Nordic countries: 475 clinical trials involving 83,903 patients are missing results",
+            "url": "https://pubmed.ncbi.nlm.nih.gov/39900256",
+            "snippet": "Short snippet.",
+            "tier": "P1",
+            "doi": "10.1016/j.eurpub.2024.39900256",
+            "authors": ["Nilsonne G"],
+        }
+        merged = dedup_sources_canonical([web, academic])
+        assert len(merged) == 1
+        # richest snippet wins → the web record's URL becomes canonical,
+        # the academic URL is preserved in also_found_in
+        assert merged[0]["url"] == "https://www.transparimed.org/single-post/nordic-trials"
+        assert "https://pubmed.ncbi.nlm.nih.gov/39900256" in merged[0].get("also_found_in", [])
+        assert merged[0]["doi"] == "10.1016/j.eurpub.2024.39900256"
+        # tier only upgrades, never downgrades: the peer-reviewed twin lifts
+        # the merged record to P1 while the web landing page stays canonical
+        assert merged[0]["tier"] == "P1"
+
+    def test_independence_same_org_not_independent(self):
+        from agent.research_engine import _sources_are_independent
+        a = {"url": "https://www.transparimed.org/single-post/nordic-trials"}
+        b = {"url": "https://www.transparimed.org/single-post/metascience-fail"}
+        assert not _sources_are_independent(a, b)
+
+
+class TestEvidenceWebReservation:
+    """build_evidence_corpus must reserve full-text fetches for web records
+    that score 0 — the TranspariMED page was cited but never fetched live."""
+
+    def _mk_sources(self):
+        academic = [
+            {"title": f"Academic paper {i}", "url": f"https://journal{i}.org/p{i}",
+             "snippet": "s", "tier": "P1", "score": 0.5 + i * 0.01}
+            for i in range(8)
+        ]
+        web = [
+            {"title": "Nordic countries: 475 clinical trials",
+             "url": "https://www.transparimed.org/single-post/nordic-trials",
+             "snippet": "475 trials missing results", "tier": "P2",
+             "source_name": "zai_web", "extra": {"web": True}},
+            {"title": "Trials tracker page",
+             "url": "https://eu.trialstracker.net/sponsor/rigshospitalet",
+             "snippet": "late reporting", "tier": "P2",
+             "source_name": "zai_web", "extra": {"web": True}},
+            {"title": "Blog opinion", "url": "https://someblog.net/op",
+             "snippet": "thoughts", "tier": "P3",
+             "source_name": "zai_web", "extra": {"web": True}},
+        ]
+        return academic + web
+
+    def test_web_records_get_reserved_fetch_slots(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        fetched = []
+
+        async def fake_fulltext(source):
+            fetched.append(source["url"])
+            return "Full text body. " * 100
+
+        monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
+        sources = self._mk_sources()
+        corpus = asyncio.run(ef.build_evidence_corpus(sources, top_n=6, web_slots=2))
+        # top-6 score cut = the 8 academics' best 6; the 2 highest web records
+        # (both transparimed/trialstracker, ranked by score then list order)
+        # must be reserved in addition
+        assert any("transparimed.org" in u for u in fetched), fetched
+        assert any("trialstracker.net" in u for u in fetched), fetched
+        assert not any("someblog.net" in u for u in fetched)
+        # chunks exist and carry correct 1-based source indexes
+        assert corpus.chunks
+        fetched_urls = {s["url"] for s in sources if s["url"] in set(fetched)}
+        idxs = {c.source_idx for c in corpus.chunks}
+        for url in fetched_urls:
+            i = next(i for i, s in enumerate(sources, 1) if s["url"] == url)
+            assert i in idxs
+
+    def test_web_slots_zero_disables_reservation(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        fetched = []
+
+        async def fake_fulltext(source):
+            fetched.append(source["url"])
+            return "Full text body. " * 100
+
+        monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
+        asyncio.run(ef.build_evidence_corpus(self._mk_sources(), top_n=6, web_slots=0))
+        assert not any("transparimed.org" in u for u in fetched)
+
+    def test_web_record_inside_top_n_not_double_fetched(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        fetched = []
+
+        async def fake_fulltext(source):
+            fetched.append(source["url"])
+            return "Full text body. " * 100
+
+        monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
+        sources = [{"title": "Web top", "url": "https://www.transparimed.org/x",
+                    "snippet": "s", "tier": "P2", "source_name": "zai_web",
+                    "extra": {"web": True}}] + \
+                  [{"title": f"A{i}", "url": f"https://j{i}.org/p", "snippet": "s",
+                    "tier": "P1", "score": 0.4} for i in range(5)]
+        asyncio.run(ef.build_evidence_corpus(sources, top_n=4, web_slots=2))
+        assert fetched.count("https://www.transparimed.org/x") == 1
+
+
+class TestWebQueryDedup:
+    """expand_query_variants returns the original query first — the web
+    budget must not burn identical queries twice (live run7 finding)."""
+
+    def test_duplicate_primary_not_refired(self, monkeypatch):
+        import tools.search_sources as ts
+
+        seen_queries = []
+
+        async def fake_search(query, num):
+            seen_queries.append(query)
+            return []
+
+        monkeypatch.setattr(ts, "search_zai_web", fake_search)
+        _s, stats = asyncio.run(
+            _web_sources_for_report(
+                "unpublished trials",
+                ["unpublished trials", "variant two"],
+                "thorough",
+            )
+        )
+        assert seen_queries == ["unpublished trials", "variant two"]
+        assert stats["queries"] == ["unpublished trials", "variant two"]
+
+    def test_case_insensitive_dedup(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def fake_search(query, num):
+            return []
+
+        monkeypatch.setattr(ts, "search_zai_web", fake_search)
+        _s, stats = asyncio.run(
+            _web_sources_for_report("Trials Query", ["trials query"], "quick")
+        )
+        assert stats["queries"] == ["Trials Query"]
+
+
+class TestRelevanceGateCoreQuestion:
+    """The gate must answer 'does this source answer the CORE question',
+    not 'does it share the expansion variants' jargon'. Live run7: an SEO
+    page scored 0.174 on union vocab and passed while the page carrying the
+    question's actual empirics scored 0.13 and died."""
+
+    QUERY = "Meta-analysis of unpublished negative-result trials that never made it into public databases."
+    VARIANTS = [
+        "Statistical methods for addressing publication bias in meta-analysis through the inclusion of unpublished negative-result trials.",
+        "Systematic approaches to identifying and incorporating unpublished negative-result trials in meta-analyses to improve research synthesis accuracy.",
+    ]
+    EMPIRICS = {
+        "title": "Four lessons from inaccurate data on missing clinical trial results",
+        "snippet": "475 clinical trials involving 83,903 patients across five Nordic countries had never made their results public. 23% of Rigshospitalet trials lacked results.",
+        "url": "https://www.transparimed.org/single-post/metascience-fail",
+        "tier": "P2",
+        "source_name": "zai_web",
+        "extra": {"web": True},
+    }
+    JARGON = {
+        "title": "Publication bias in clinical research",
+        "snippet": "systematic approaches meta-analytic evidence synthesis accuracy improvement services",
+        "url": "https://pubrica.example.com/services",
+        "tier": "P3",
+    }
+
+    def test_core_relevance_keeps_empirics_drops_jargon(self):
+        # 5 clearly core-matching sources fill the relevance_floor (5) so the
+        # floor's top-up cannot rescue the jargon page
+        core_fillers = [
+            {"title": f"Unpublished trials and missing results study {i}",
+             "snippet": "meta-analysis unpublished negative trials results databases",
+             "url": f"https://journal{i}.example.org/p", "tier": "P1"}
+            for i in range(5)
+        ]
+        selected = select_diverse_sources(
+            [self.EMPIRICS, self.JARGON] + core_fillers,
+            max_sources=10,
+            query=self.QUERY,
+            query_variants=self.VARIANTS,
+        )
+        urls = [s["url"] for s in selected]
+        assert "https://www.transparimed.org/single-post/metascience-fail" in urls
+        assert "https://pubrica.example.com/services" not in urls
+
+    def test_padding_still_dropped_when_matching_neither_core_nor_variants(self):
+        padding = {
+            "title": "Coral reef restoration program outreach",
+            "snippet": "community engagement marine biodiversity workshops",
+            "url": "https://reefs.example.org/program",
+            "tier": "P3",
+        }
+        core_fillers = [
+            {"title": f"Unpublished trials and missing results study {i}",
+             "snippet": "meta-analysis unpublished negative trials results databases",
+             "url": f"https://journal{i}.example.org/p", "tier": "P1"}
+            for i in range(5)
+        ]
+        selected = select_diverse_sources(
+            [self.EMPIRICS, padding] + core_fillers,
+            max_sources=10,
+            query=self.QUERY,
+            query_variants=self.VARIANTS,
+        )
+        urls = {s["url"] for s in selected}
+        assert self.EMPIRICS["url"] in urls
+        assert padding["url"] not in urls

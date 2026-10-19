@@ -312,10 +312,22 @@ _STOPWORDS = {
 }
 
 
+def _normalize_term(w: str) -> str:
+    """Light plural normalization — trials→trial, results→result, studies→study.
+    Full stemming is overkill; singular/plural confusion measurably hurts the
+    relevance gate on clinical vocabulary (trial(s), result(s), patient(s))."""
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 3 and w.endswith("s") and not w.endswith(("ss", "us", "is")):
+        return w[:-1]
+    return w
+
+
 def _content_words(text: str) -> set:
-    """Lowercased alphanumeric content words (len>=4, stopwords removed)."""
+    """Lowercased alphanumeric content words (len>=4, stopwords removed,
+    plural-normalized)."""
     words = re.findall(r"[a-z0-9]{4,}", (text or "").lower())
-    return {w for w in words if w not in _STOPWORDS}
+    return {_normalize_term(w) for w in words if w not in _STOPWORDS}
 
 
 def _source_relevance(source: Dict, query_vocab: set) -> float:
@@ -427,11 +439,31 @@ def select_diverse_sources(
     # ── Pass 0: relevance gate ──
     dropped_irrelevant = 0
     if query:
-        vocab = _content_words(query)
+        core_vocab = _content_words(query)
+        vocab = set(core_vocab)
         for v in (query_variants or []):
             vocab |= _content_words(v)
         if vocab:
-            scored = [( _source_relevance(s, vocab), s) for s in sources]
+            def _gated_relevance(s: Dict) -> float:
+                """Core-question relevance, with an expansion fallback only
+                for zero-core-overlap sources.
+
+                The CORE question is what a source must answer; expansion
+                variants merely corroborate. Union-vocab scoring alone let
+                jargon-matching padding (SEO pages, method-blog prose) pass
+                at 0.17 while the page carrying the question's actual
+                empirics scored 0.13 and died — the live run7 finding, and
+                the exact 'keyword hits, not answers' failure class. A pure
+                max(core, 0.6*full) blend still lets dense-jargon pages
+                outweigh weak-but-real core matches, so the fallback lane
+                is reserved for sources with NO core overlap at all.
+                """
+                core_rel = _source_relevance(s, core_vocab) if core_vocab else 0.0
+                if core_rel > 0:
+                    return core_rel
+                return 0.6 * _source_relevance(s, vocab)
+
+            scored = [(_gated_relevance(s), s) for s in sources]
             kept = [s for rel, s in scored if rel >= min_relevance]
             dropped_irrelevant = len(sources) - len(kept)
             if len(kept) < relevance_floor:
@@ -448,7 +480,8 @@ def select_diverse_sources(
             if dropped_irrelevant:
                 logger.info(
                     f"Relevance gate: dropped {dropped_irrelevant} low-relevance "
-                    f"sources (vocab={len(vocab)} words, threshold={min_relevance})"
+                    f"sources (core_vocab={len(core_vocab)}, full_vocab={len(vocab)}, "
+                    f"threshold={min_relevance})"
                 )
             sources = kept
 
@@ -1088,6 +1121,135 @@ async def parallel_research(
 # ═══════════════════════════════════════════════════════════════
 # UPGRADE #4: RESEARCH REPORT MODE
 # ═══════════════════════════════════════════════════════════════
+
+
+def _web_query_rewrite(query: str, max_words: int = 8) -> str:
+    """Deterministic keyword rewrite of the primary query for web indexes.
+
+    HyDE variants wrap the question in academic prose ("Technical analysis
+    of...") which web engines match far worse than concrete keywords. This
+    rewrite is pure query-derived vocabulary (no hard-coded topics): stopword
+    stripping + dedupe, first `max_words` content words kept.
+    """
+    words = re.findall(r"[a-zA-Z0-9][a-zA-Z0-9\-]{2,}", query or "")
+    seen, out = set(), []
+    for w in words:
+        k = w.lower()
+        if k in _STOPWORDS or k in seen or len(w) < 3:
+            continue
+        seen.add(k)
+        out.append(w)
+        if len(out) >= max_words:
+            break
+    return " ".join(out)
+
+
+async def _web_sources_for_report(
+    query: str,
+    variants: List[str],
+    depth: str = "quick",
+) -> Tuple[List[Dict], Dict]:
+    """
+    Grey-literature retrieval: general web search via the keyless z-ai bridge.
+
+    The academic fan-out structurally cannot see NGO/transparency reports,
+    regulator notices, or institutional news pages — often the empirical
+    material that motivates the question (live case: TranspariMED's Nordic
+    unreported-trials reports are indexed by no academic API, yet carry the
+    475-trial, Rigshospitalet, and Haukeland numbers the literature then
+    studies). Web records enter the pool as ORDINARY members: they flow
+    through canonical dedup, the junk/encyclopedia gates, the relevance
+    gate, and the deterministic bibliography, honestly labeled (tier from
+    grey-literature governance, category 'web', source_name 'zai_web').
+
+    Budget is deliberately small: the primary query + at most one variant
+    (quick) / two variants (thorough), 8 hits per query.
+
+    Returns (source_dicts, stats) — stats are reported verbatim in the
+    report's evidence metadata so downstream consumers know whether web
+    retrieval ran at all (available=false when the bridge is down).
+    """
+    stats = {
+        "enabled": os.getenv("APEX_WEB_SEARCH", "true").lower() in ("1", "true", "yes"),
+        "available": False,
+        "queries": [],
+        "results": 0,
+        "inserted": 0,
+    }
+    if not stats["enabled"]:
+        return [], stats
+
+    from tools.search_sources import search_zai_web
+
+    # HyDE variants return the ORIGINAL query as their first element and
+    # wrap the rest in academic prose that web engines match poorly (live
+    # run7: the "Technical analysis of..." phrasing returned zero grey-lit
+    # hits while the plain query returned the TranspariMED reports). Budget:
+    # primary + deterministic keyword rewrite (always distinct vocab) + at
+    # most 2 genuinely-new variants (thorough).
+    extra_variants = [
+        v for v in (variants or [])
+        if v and v.strip().lower() != (query or "").strip().lower()
+    ]
+    candidates = [query, _web_query_rewrite(query)]
+    if depth == "thorough":
+        candidates += extra_variants[:2]
+    seen_q = set()
+    queries = []
+    for cand in candidates:
+        q = (cand or "").strip()[:300]
+        if q and q.lower() not in seen_q:
+            seen_q.add(q.lower())
+            queries.append(q)
+    stats["queries"] = queries
+    if not queries:
+        return [], stats
+
+    try:
+        lists = await asyncio.gather(
+            *[search_zai_web(q, 10) for q in queries],
+            return_exceptions=True,
+        )
+    except Exception as e:
+        logger.warning(f"Web search failed (non-fatal): {e}")
+        return [], stats
+
+    flat: List[Any] = []
+    ok_queries = 0
+    seen: set = set()
+    for lst in lists:
+        if isinstance(lst, Exception):
+            logger.debug(f"Web search query failed: {lst}")
+            continue
+        if not lst:
+            continue
+        ok_queries += 1
+        for r in lst:
+            if getattr(r, "url", "") in seen:
+                continue
+            seen.add(r.url)
+            flat.append(r)
+
+    stats["results"] = len(flat)
+    stats["available"] = ok_queries > 0
+
+    out: List[Dict] = []
+    for r in flat:
+        out.append({
+            "url": r.url,
+            "title": r.title,
+            "snippet": r.snippet,
+            "tier": enforce_source_tier(r.url, r.source_tier),
+            "source_name": r.source_name,
+            "category": "web",
+            "published_date": r.published_date,
+            "extra": dict(getattr(r, "extra", {}) or {}),
+        })
+    stats["inserted"] = len(out)
+    logger.info(
+        f"Web search: {len(out)} grey-literature records from {ok_queries}/{len(queries)} queries"
+    )
+    return out, stats
 
 RESEARCH_REPORT_SYSTEM_PROMPT_QUICK = """You are APEX Research, an expert research analyst producing comprehensive, evidence-based reports.
 
@@ -1867,7 +2029,7 @@ async def generate_research_report(
     variants = await expand_query_variants(query, max_variants=3 if depth == "thorough" else 2)
     logger.info(f"Query expanded into {len(variants)} variants")
 
-    # ── Step 2: HYBRID research — live search per variant ⊕ RAG corpus, concurrent ──
+    # ── Step 2: HYBRID research — live search per variant ⊕ RAG corpus ⊕ web, concurrent ──
     live_tasks = [
         parallel_research(
             v,
@@ -1878,11 +2040,13 @@ async def generate_research_report(
         for v in variants
     ]
     rag_task = _rag_sources_for_report(query)
+    web_task = _web_sources_for_report(query, variants, depth)
 
     live_results = await asyncio.gather(*live_tasks, return_exceptions=True)
     rag_sources = await rag_task
+    web_sources, web_stats = await web_task
 
-    all_sources: List[Dict] = list(rag_sources)
+    all_sources: List[Dict] = list(rag_sources) + list(web_sources)
     successful: List[str] = []
     failed: List[str] = []
     for res in live_results:
@@ -1890,6 +2054,10 @@ async def generate_research_report(
             all_sources.extend(res.results)
             successful.extend(res.successful_sources)
             failed.extend(res.failed_sources)
+    if web_stats.get("available"):
+        successful.append("zai_web")
+    elif web_stats.get("enabled"):
+        failed.append("zai_web: bridge unavailable")
 
     # ── Step 3: Canonical dedup → diverse selection → domain-aware decay ──
     all_sources = dedup_sources_canonical(all_sources)
@@ -2040,6 +2208,7 @@ async def generate_research_report(
     if revise_model:
         models_used.append(revise_model)
     critique["canonical_backfilled"] = backfilled_ids
+    critique["web_search"] = web_stats
 
     # Evidence stats are captured AFTER drafting/critique: used_semantic starts
     # optimistic at build time and is corrected during retrieval (degenerate
@@ -2051,6 +2220,7 @@ async def generate_research_report(
             ev_stats = evidence_stats(corpus)
         except Exception:
             ev_stats = {"chunks": 0, "fetched_sources": 0, "failed_sources": 0, "total_chars": 0, "semantic_scoring": False}
+    ev_stats["web_search"] = web_stats
 
     # ── Step 10.5: DETERMINISTIC BIBLIOGRAPHY + DEAD-SOURCE PRUNING ──
     # A revision pass regenerates the whole report INCLUDING its SOURCES

@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Dict, Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 import httpx
 
@@ -2343,6 +2343,297 @@ async def search_duckduckgo(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Z-AI BRIDGE WEB SEARCH — keyless grey-literature retrieval
+# ═══════════════════════════════════════════════════════════════
+# The academic APIs above cannot see NGO/transparency reports, regulator
+# notices, or institutional news pages — precisely the empirical material
+# that motivates many research questions (live case: TranspariMED's Nordic
+# unreported-trials reports are indexed by no academic API). The local
+# z-ai bridge (scripts/glm_bridge.mjs) exposes keyless web_search and
+# page_reader built on the same SDK the chat bridge uses. Every function
+# here degrades to [] / "" when the bridge is not running; callers must
+# treat web retrieval as best-effort and report its usage honestly.
+
+ZAI_BRIDGE_URL = os.getenv("ZAI_BRIDGE_URL", "http://127.0.0.1:8787")
+# 50s: the bridge retries slow upstream search calls inside a 45s budget —
+# a 30s client timeout would cut the retries off and lose the query.
+ZAI_TOOL_TIMEOUT = float(os.getenv("ZAI_TOOL_TIMEOUT", "50"))
+
+# Domains that are never citable evidence in a research report: social
+# platforms, UGC answer farms, note-selling sites. Dropped outright.
+_WEB_DROP_DOMAINS = {
+    "x.com", "twitter.com", "facebook.com", "instagram.com", "tiktok.com",
+    "reddit.com", "quora.com", "pinterest.com", "linkedin.com", "threads.net",
+    "youtube.com", "youtu.be", "mastodon.social", "vk.com", "weibo.com",
+    "medium.com", "substack.com",
+    "answers.com", "wikihow.com", "ehow.com", "ask.com", "coursehero.com",
+    "chegg.com", "scribd.com", "slideshare.net", "quizlet.com", "brainly.com",
+}
+
+# Junk TLDs — near-zero citable content, high spam density.
+_WEB_DROP_TLDS = {
+    ".xyz", ".top", ".buzz", ".click", ".link", ".club", ".fun", ".icu",
+    ".cfd", ".rest", ".lol", ".shop", ".online", ".website", ".space", ".site",
+}
+
+# Credible grey literature: transparency NGOs, evidence bodies, regulators.
+# These publish primary empirical material but are peer-review-free, so
+# they get P2 — citable, honestly labeled, never passed off as P1.
+_WEB_GREY_P2 = {
+    "transparimed.org", "senseaboutscience.org", "cochrane.org",
+    "cochranelibrary.com", "alltrials.net", "haiweb.org",
+    "trialstracker.net", "consilium-scientific.org", "oecd.org",
+    "ema.europa.eu", "who.int", "worldbank.org", "pewresearch.org",
+    "ourworldindata.org", "kff.org", "healthpolicy-watch.news",
+}
+
+# Institutional suffixes: government and academia publish enormous amounts
+# of grey literature outside the _WEB_GREY_P2 exact list.
+_WEB_GREY_P2_SUFFIXES = (
+    ".gov", ".gov.uk", ".edu", ".ac.uk", ".edu.au", ".edu.hk",
+    ".ac.nz", ".europa.eu", ".int",
+)
+
+# URL query parameters that are tracking noise, never identity.
+_WEB_TRACKING_PARAM_RE = re.compile(
+    r"^(utm_[a-z]+|fbclid|gclid|dclid|mc_[ce]id|igshid|ref(_src)?|cmpid|"
+    r"spm|scid|share_id|_hsenc|_hsmi|s|cid)$",
+    re.I,
+)
+
+_WEB_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def canonicalize_web_url(url: str) -> str:
+    """
+    Canonical form of a web URL for dedup and citation: lowercase host,
+    no fragment, tracking params stripped, trailing slashes collapsed.
+    Non-http(s) URLs return unchanged; garbage returns "".
+    """
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(raw)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return raw
+        query = [
+            (k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+            if not _WEB_TRACKING_PARAM_RE.match(k)
+        ]
+        path = re.sub(r"/+$", "", parts.path)
+        return urlunsplit((
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            path,
+            urlencode(query),
+            "",
+        ))
+    except Exception:
+        return raw
+
+
+def _web_date_to_iso(date: Optional[str]) -> Optional[str]:
+    """'Feb 6, 2024' → '2024-02-06'. Falls back to a bare 4-digit year.
+    Returns None when no date can be extracted."""
+    d = (date or "").strip()
+    if not d:
+        return None
+    m = re.search(r"([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})", d)
+    if m:
+        month = _WEB_MONTHS.get(m.group(1)[:3].lower())
+        if month:
+            return f"{m.group(3)}-{month:02d}-{int(m.group(2)):02d}"
+    y = re.search(r"\b(19|20)\d{2}\b", d)
+    return y.group(0) if y else None
+
+
+def _web_host(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _web_result_tier(url: str) -> str:
+    """
+    Grey-literature governance tier for a web hit, BEFORE the global domain
+    map (enforce_source_tier) has its say: 'DROP' for social/UGC/junk-TLD,
+    'P2' for credible grey literature, 'P3' for the unknown open web.
+    """
+    try:
+        host = _web_host(url)
+    except Exception:
+        return "DROP"
+    if not host or "." not in host:
+        return "DROP"
+    for d in _WEB_DROP_DOMAINS:
+        if host == d or host.endswith("." + d):
+            return "DROP"
+    for tld in _WEB_DROP_TLDS:
+        if host.endswith(tld):
+            return "DROP"
+    for d in _WEB_GREY_P2:
+        if host == d or host.endswith("." + d):
+            return "P2"
+    for sfx in _WEB_GREY_P2_SUFFIXES:
+        if host == sfx.lstrip(".") or host.endswith(sfx):
+            return "P2"
+    return "P3"
+
+
+async def _bridge_request(
+    path: str,
+    payload: Dict[str, Any],
+    timeout: Optional[float] = None,
+) -> Any:
+    """JSON POST to the local z-ai tool bridge. Raises on any failure so
+    callers can degrade honestly."""
+    async with httpx.AsyncClient(timeout=timeout or ZAI_TOOL_TIMEOUT) as client:
+        r = await client.post(f"{ZAI_BRIDGE_URL}{path}", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def search_zai_web(
+    query: str,
+    max_results: int = 8,
+) -> List[SearchResult]:
+    """
+    General web search via the local z-ai bridge — the keyless provider for
+    grey literature (NGO reports, regulator notices, institutional pages)
+    that no academic API indexes.
+
+    Governance applied here, before any result reaches the pool:
+      - URL canonicalization (tracking params, fragments, trailing slashes)
+      - social / UGC / junk-TLD hits dropped outright
+      - credible grey literature (transparency NGOs, gov/edu/int) → P2
+      - the unknown open web → P3 (the relevance + diversity gates decide)
+      - search-engine dates parsed into ISO published_date
+
+    Returns [] when the bridge is down — never raises.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    try:
+        data = await _bridge_request(
+            "/web_search",
+            {"query": q[:300], "num": max(1, min(int(max_results), 10))},
+        )
+    except Exception as e:
+        logger.warning(f"zai_web search failed (bridge down?): {e}")
+        return []
+
+    rows = data if isinstance(data, list) else (data or {}).get("results", [])
+    results: List[SearchResult] = []
+    seen: set = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = canonicalize_web_url(str(row.get("url") or ""))
+        title = re.sub(r"\s+", " ", str(row.get("name") or "")).strip()
+        if not url or not title:
+            continue
+        tier = _web_result_tier(url)
+        if tier == "DROP" or url in seen:
+            continue
+        seen.add(url)
+        results.append(SearchResult(
+            title=title[:300],
+            url=url,
+            snippet=re.sub(r"\s+", " ", str(row.get("snippet") or "")).strip(),
+            source_name="zai_web",
+            source_category=SourceCategory.WEB,
+            source_tier=tier,
+            published_date=_web_date_to_iso(row.get("date")),
+            extra={"web": True, "host": str(row.get("host_name") or "")},
+        ))
+        if len(results) >= max_results:
+            break
+    return results
+
+
+def _relaxed_page_text(html: str) -> str:
+    """
+    Conservative full-page text extraction for JS-framework layouts (Wix,
+    Squarespace) where clean_html's main-content heuristics can under-extract:
+    those DOMs split article text across hundreds of sibling divs and label
+    containers with class names the aggressive ad-patterns decompose.
+
+    Strategy: drop only clearly-destructive tags, prefer <article>/<main>/
+    <body>, keep every line with real characters. Noisier than clean_html,
+    but the evidence chunker + relevance scoring filter the rest.
+    """
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        for tag_name in (
+            "script", "style", "noscript", "svg", "iframe", "form", "template",
+            "nav", "footer", "header", "aside",
+        ):
+            for t in soup.find_all(tag_name):
+                t.decompose()
+        root = soup.find("article") or soup.find("main") or soup.body or soup
+        text = root.get_text("\n") if root else ""
+    except Exception:
+        text = re.sub(r"<[^>]+>", " ", html)
+
+    lines = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if len(ln) >= 3 and re.search(r"[A-Za-z0-9]", ln):
+            lines.append(ln)
+    cleaned = re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
+    try:
+        from ingest.html_cleaner import clean_markdown
+
+        cleaned = clean_markdown(cleaned)
+    except Exception:
+        pass
+    return cleaned.strip()
+
+
+async def fetch_page_text(url: str, max_chars: int = 120_000) -> str:
+    """
+    Full page text via the bridge's page_reader (JS-rendered, handles
+    Wix/Squarespace sites that defeat plain httpx scraping) followed by
+    boilerplate stripping: clean_html first, then a relaxed extraction
+    when clean_html under-extracts. Returns "" on any failure — callers
+    fall back to the 3-tier scrape chain.
+    """
+    clean_url = canonicalize_web_url(url)
+    if not clean_url or not clean_url.startswith("http"):
+        return ""
+    try:
+        data = await _bridge_request("/page_reader", {"url": clean_url}, timeout=60)
+    except Exception as e:
+        logger.debug(f"page_reader failed for {clean_url}: {e}")
+        return ""
+    html = ""
+    if isinstance(data, dict):
+        # SDK envelope: {code, data: {html, title, publishedTime}, status};
+        # tolerate a bare {html} shape for future bridge versions.
+        inner = data.get("data") or {}
+        html = (inner.get("html") if isinstance(inner, dict) else "") or data.get("html", "")
+    if not html or len(html) < 500:
+        return ""
+    from ingest.html_cleaner import clean_html
+
+    text = clean_html(html, url=clean_url) or ""
+    if len(text) < 1000:
+        # JS-framework layouts can defeat clean_html's main-content heuristic;
+        # the relaxed pass trades some nav noise for never losing the story.
+        relaxed = _relaxed_page_text(html)
+        if len(relaxed) > len(text):
+            text = relaxed
+    return text[:max_chars]
+
+
+# ═══════════════════════════════════════════════════════════════
 # CITATION SNOWBALLING — SEMANTIC SCHOLAR GRAPH EXPANSION
 # ═══════════════════════════════════════════════════════════════
 
@@ -2546,6 +2837,7 @@ SOURCE_FUNCTIONS = {
     "wolfram": search_wolfram,
     "google_patents": search_google_patents,
     "duckduckgo": search_duckduckgo,
+    "zai_web": search_zai_web,
 }
 
 
@@ -2669,6 +2961,7 @@ def get_source_status() -> Dict[str, Any]:
         "reddit": {"key_needed": False, "status": "Free (Serper fallback)", "category": "news"},
         "mastodon": {"key_needed": False, "status": "Free, open API", "category": "social"},
         "duckduckgo": {"key_needed": False, "status": "Free, no limits", "category": "web"},
+        "zai_web": {"key_needed": False, "status": "Free via local z-ai bridge (scripts/glm_bridge.mjs); grey-literature governance applied", "key_configured": True, "category": "web+grey_literature"},
         "wikipedia_offline": {"key_needed": False, "status": "Free via IPFS/Kiwix", "category": "offline"},
         # Free tier with key
         "semantic_scholar": {"key_needed": "optional", "status": "Rate-limited w/o key (100/5min)", "key_configured": bool(SEMANTIC_SCHOLAR_API_KEY), "category": "academic"},

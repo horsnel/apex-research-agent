@@ -127,27 +127,67 @@ async def _fetch_scraped_text(source: Dict) -> str:
     return ""
 
 
+async def _fetch_web_text(source: Dict) -> str:
+    """Full text for web/grey-literature records via the bridge page_reader.
+
+    JS-rendered sites (Wix-hosted NGO reports, Squarespace news pages) defeat
+    plain httpx scraping; the bridge's page_reader renders them. Only web
+    records (source_name 'zai_web' / extra.web) take this route, and an
+    empty result falls through to the scrape chain — never a dead end.
+    """
+    is_web = _is_web_record(source)
+    if not is_web:
+        return ""
+    try:
+        from tools.search_sources import fetch_page_text
+
+        text = await asyncio.wait_for(
+            fetch_page_text(source.get("url", "")),
+            timeout=EVIDENCE_FETCH_TIMEOUT,
+        )
+        if text and len(text) > 300:
+            logger.info(
+                f"Evidence page fetched via page_reader: {source.get('url', '')[:80]} ({len(text)} chars)"
+            )
+        return text[:EVIDENCE_MAX_CHARS_PER_SOURCE]
+    except Exception as e:
+        logger.debug(f"page_reader evidence fetch failed for {source.get('url', '')}: {e}")
+        return ""
+
+
 async def fetch_source_fulltext(source: Dict) -> str:
     """
     Fetch full text for a single source.
 
-    Order: OA PDF (Unpaywall, best for academic sources) → live scrape
-    (3-tier fallback). Returns "" when both fail. Snippet-only sources
-    still work downstream — they just contribute fewer evidence chunks.
+    Order: OA PDF (Unpaywall, best for academic sources) → bridge page_reader
+    (web/grey-literature records, JS-rendered pages) → live scrape (3-tier
+    fallback). Returns "" when all routes fail. Snippet-only sources still
+    work downstream — they just contribute fewer evidence chunks.
     """
     # 1. Open-access PDF route (academic sources with DOIs)
     text = await _fetch_pdf_text(source)
     if text and len(text) > 500:
         return text
 
-    # 2. Scrape route
+    # 2. Bridge page_reader route (web/grey-literature records)
+    text = await _fetch_web_text(source)
+    if text and len(text) > 500:
+        return text
+
+    # 3. Scrape route
     text = await _fetch_scraped_text(source)
     return text or ""
+
+
+def _is_web_record(s: Dict) -> bool:
+    """True for grey-literature records retrieved via the z-ai web provider."""
+    return s.get("source_name") == "zai_web" or bool((s.get("extra") or {}).get("web"))
 
 
 async def build_evidence_corpus(
     sources: List[Dict],
     top_n: int = EVIDENCE_TOP_SOURCES,
+    web_slots: int = 2,
 ) -> EvidenceCorpus:
     """
     Build a full-text evidence corpus from the top-ranked sources.
@@ -157,9 +197,17 @@ async def build_evidence_corpus(
     with the source's 1-BASED index in the caller's source list (so report
     citations [S{n}] match the final SOURCES section).
 
+    WEB RESERVATION: web/grey-literature records carry no upstream score,
+    so pure score ranking can leave them all unfetched even when they hold
+    the empirical heart of the story (live case: the TranspariMED Nordic
+    page was cited [S3] but its 475/83,903 numbers never reached a drafter
+    because snippet-only records scored 0). Up to `web_slots` highest-ranked
+    web records outside the top_n are therefore always fetched too.
+
     Args:
         sources: The final, deduplicated, ranked source list
         top_n: How many top sources to fetch full text for
+        web_slots: Reserved full-text fetches for web/grey-literature records
 
     Returns:
         EvidenceCorpus (possibly empty — callers must handle gracefully)
@@ -169,11 +217,26 @@ async def build_evidence_corpus(
         return corpus
 
     # Rank candidate sources for fetching (never mutate caller's order)
-    candidates = sorted(
+    ranked = sorted(
         range(len(sources)),
         key=lambda i: _source_score(sources[i]),
         reverse=True,
-    )[:top_n]
+    )
+    candidates = ranked[:top_n]
+
+    # Web reservation: highest-ranked web records outside the score cut
+    if web_slots > 0:
+        chosen = set(candidates)
+        web_reserved = [
+            i for i in ranked
+            if i not in chosen and _is_web_record(sources[i])
+        ][:web_slots]
+        if web_reserved:
+            candidates = candidates + web_reserved
+            logger.info(
+                f"Evidence corpus: reserved {len(web_reserved)} web/grey-literature "
+                f"fetch slots outside the top-{top_n} score cut"
+            )
 
     async def _fetch_one(idx: int) -> tuple:
         text = await fetch_source_fulltext(sources[idx])
