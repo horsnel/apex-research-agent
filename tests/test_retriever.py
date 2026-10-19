@@ -486,7 +486,11 @@ class TestFallbackChain:
     """Tests for the 9-model fallback chain configuration."""
 
     def test_chain_has_9_models(self):
-        assert len(FALLBACK_CHAIN) == 9
+        # 9 core models + OpenAI-Compat provider fallback (any OpenAI-
+        # compatible endpoint via OPENAI_BASE_URL) = 10
+        assert len(FALLBACK_CHAIN) == 10
+        compat = [m for m in FALLBACK_CHAIN if m.provider == Provider.OPENAI]
+        assert len(compat) == 1 and compat[0].tier == "mid"
 
     def test_first_model_is_passthrough(self):
         assert FALLBACK_CHAIN[0].provider == Provider.PASSTHROUGH
@@ -553,11 +557,11 @@ class TestRouterStatus:
         assert isinstance(status, dict)
         assert "total_models" in status
         assert "models" in status
-        assert status["total_models"] == 9
+        assert status["total_models"] == 10
 
     def test_status_shows_all_models(self):
         status = get_router_status()
-        assert len(status["models"]) == 9
+        assert len(status["models"]) == 10
 
     def test_status_shows_provider_config(self):
         status = get_router_status()

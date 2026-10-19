@@ -635,3 +635,30 @@ class TestTotalLLMFailureHonesty:
             "query", [], VerificationResult(claims=[]), "quick",
         ))
         assert out == body
+
+
+class TestOpenAICompatProvider:
+    """The router must be able to escape single-provider outages (live-seen:
+    Cloudflare free-tier neuron gate stuck at 429 across reset windows) by
+    falling back to any OpenAI-compatible endpoint via OPENAI_BASE_URL."""
+
+    def test_default_url_is_real_openai(self, monkeypatch):
+        import agent.llm_router as lr
+        monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+        assert lr._openai_chat_url() == "https://api.openai.com/v1/chat/completions"
+
+    def test_base_url_override(self, monkeypatch):
+        import agent.llm_router as lr
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:8795/v1/")
+        assert lr._openai_chat_url() == "http://127.0.0.1:8795/v1/chat/completions"
+
+    def test_compat_model_in_report_chain(self):
+        from agent.llm_router import select_tier
+        models = select_tier(task_type="report")
+        names = [m.name for m in models]
+        assert "OpenAI-Compat" in names, f"compat fallback missing from report chain: {names}"
+
+    def test_compat_model_not_in_classification(self):
+        from agent.llm_router import select_tier
+        models = select_tier(task_type="classification")
+        assert all(m.tier in ("cheap", "free") for m in models)

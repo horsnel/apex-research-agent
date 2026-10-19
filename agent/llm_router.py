@@ -50,7 +50,16 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_MODELS_BASE_URL = os.getenv("GITHUB_MODELS_BASE_URL", "https://models.inference.ai.azure.com")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, Groq, OpenRouter,
+# local proxies) can serve as a provider fallback via this base URL.
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+
+def _openai_chat_url() -> str:
+    """Chat-completions endpoint for the configured OpenAI-compatible base URL."""
+    base = os.getenv("OPENAI_BASE_URL", OPENAI_BASE_URL)
+    return f"{base.rstrip('/')}/chat/completions"
 
 DEFAULT_SYNTHESIS_TOKENS = int(os.getenv("DEFAULT_SYNTHESIS_TOKENS", "150"))
 MAX_SYNTHESIS_TOKENS = int(os.getenv("MAX_SYNTHESIS_TOKENS", "300"))
@@ -306,6 +315,21 @@ def _get_default_chain() -> List[ModelConfig]:
             tier="capable",
             description="70B flagship. Final fallback for hardest queries. Highest quality on CF.",
         ),
+        ModelConfig(
+            name="OpenAI-Compat",
+            provider=Provider.OPENAI,
+            model_id="gpt-4o-mini",
+            context_window=128000,
+            max_output_tokens=8192,
+            price_input_per_m=0.0,
+            price_output_per_m=0.0,
+            tier="mid",
+            description=(
+                "Generic OpenAI-compatible fallback (honors OPENAI_BASE_URL: "
+                "Ollama, vLLM, Groq, OpenRouter, local proxies). Escapes "
+                "single-provider outages like a stuck daily quota."
+            ),
+        ),
     ]
 
 
@@ -532,12 +556,14 @@ async def _call_openai_direct(
     max_tokens: int = DEFAULT_SYNTHESIS_TOKENS,
     temperature: float = 0.0,
 ) -> LLMCallResult:
-    """Call OpenAI directly (legacy fallback)."""
+    """Call any OpenAI-compatible endpoint (honors OPENAI_BASE_URL)."""
     start = time.time()
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # 120s: self-hosted endpoints (Ollama/vLLM) can be far slower than
+        # hosted APIs, and long report sections legitimately take >30s.
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                _openai_chat_url(),
                 headers={
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                     "Content-Type": "application/json",

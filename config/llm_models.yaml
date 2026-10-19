@@ -146,6 +146,22 @@ models:
     enabled: true
     description: "70B flagship. Final fallback for hardest queries. Highest quality on CF."
 
+  # ── Optional: any OpenAI-compatible endpoint (Ollama, vLLM, Groq, proxies) ──
+  # Endpoint defaults to https://api.openai.com/v1; override with OPENAI_BASE_URL.
+  # Activates automatically when OPENAI_API_KEY is present. Use this to escape
+  # single-provider outages (e.g. a stuck Cloudflare daily-neuron quota).
+  - name: "OpenAI-Compat"
+    provider: "openai"
+    model_id: "gpt-4o-mini"
+    context_window: 128000
+    max_output_tokens: 8192
+    price_input_per_m: 0.0
+    price_output_per_m: 0.0
+    supports_tools: false
+    tier: "mid"
+    enabled: true
+    description: "Generic OpenAI-compatible fallback. Honors OPENAI_BASE_URL for self-hosted or third-party endpoints."
+
   # ── Bonus: GitHub Models (free tier, 150 req/day) ──
   # Uncomment to enable as additional fallbacks beyond Tier 9
 
