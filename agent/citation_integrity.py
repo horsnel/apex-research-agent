@@ -695,6 +695,58 @@ def scan_off_topic_padding(query: str, sources: List[Dict]) -> List[Dict]:
     return flags
 
 
+# ── Evidence-depth scan (run9 verdict fix 2) ────────────────────────
+# run9 fetched full text for exactly ONE source, reasoned mostly from
+# titles/abstracts, and still produced well-cited prose — including a
+# chronic-pain section. A drafter working from abstracts cannot know any
+# claim is "established"; established language under a thin full-text base
+# is exactly how abstract-level inference dresses up as settled evidence.
+FULLTEXT_FLOOR_DEFAULT = 3
+
+_ESTABLISHED_RE = re.compile(
+    r"\b(well[- ]?established|firmly[- ]?established|established that|"
+    r"definitively|conclusively|conclusive evidence|settled (?:science|question))\b",
+    re.I,
+)
+
+
+def scan_unfounded_established(
+    report_text: str,
+    fulltext_count: int,
+    floor: int = FULLTEXT_FLOOR_DEFAULT,
+) -> List[Dict]:
+    """Flag 'established/definitive/conclusive' language when the full-text
+    evidence base is below `floor` fetched sources.
+
+    Not a ban on the WORD — with >= floor full-text sources the scan stays
+    silent. Below the floor, every paragraph using the language is flagged:
+    the evidence base is title/abstract-level and the prose must say so.
+
+    Deterministic, no I/O, fully unit-testable.
+    """
+    flags: List[Dict] = []
+    if fulltext_count >= floor or not report_text:
+        return flags
+    for para in report_text.split("\n"):
+        stripped = para.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+            continue  # headings and provenance tables don't assert evidence
+        m = _ESTABLISHED_RE.search(stripped)
+        if m:
+            flags.append({
+                "excerpt": stripped[:200],
+                "term": m.group(0).lower(),
+                "fulltext_count": fulltext_count,
+                "floor": floor,
+                "reason": (
+                    f"'{m.group(0)}' claimed with only {fulltext_count} source(s) "
+                    f"fetched at full text (floor {floor}) — the base is "
+                    f"abstract-level; qualify the sentence or drop the language"
+                ),
+            })
+    return flags
+
+
 # ── Scope-dodge scan ────────────────────────────────────────────────
 # Live failure (run7 verdict): the SCOPE section conceded the query's
 # literal demand could not be met but stayed in the safe zone — a generic

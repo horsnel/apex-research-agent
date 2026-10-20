@@ -1881,6 +1881,7 @@ async def _draft_section(
     corpus,   # EvidenceCorpus
     verification: Optional[VerificationResult],
     depth: str,
+    fulltext_count: int = 0,
 ) -> tuple:
     """
     Draft ONE report section with targeted evidence retrieval.
@@ -1912,8 +1913,16 @@ async def _draft_section(
     claims_blob = _claims_for_section(section, verification)
 
     word_target = "250-500" if depth == "quick" else "400-800"
+    depth_note = ""
+    if fulltext_count < 3:
+        depth_note = (
+            f"\nEVIDENCE-DEPTH CONSTRAINT (NON-NEGOTIABLE): only {fulltext_count} source(s) in the pool have "
+            f"fetched FULL TEXT (floor: 3). Everything else is title/abstract-level. You MUST NOT describe "
+            f"any evidence as 'established', 'well-established', 'definitive', or 'conclusive' — qualify "
+            f"claims as abstract-level wherever full text was not fetched.\n"
+        )
     user_prompt = f"""REPORT QUERY: {query}
-
+{depth_note}
 YOUR SECTION: {section.get('title', '')}
 PURPOSE: {section.get('purpose', '')}
 KEY QUESTIONS TO ANSWER:
@@ -2197,6 +2206,11 @@ def _render_provenance_section(provenance: Dict) -> str:
         )
     if provenance.get("web_search_mode") and provenance.get("web_search_mode") != "off":
         lines.append(f"| Web retrieval mode | {provenance.get('web_search_mode')} |")
+    topical = provenance.get("topical") or {}
+    if topical.get("dropped"):
+        lines.append(
+            f"| Sources rejected by embedding topical filter | {topical.get('dropped')} |"
+        )
     lines += [
         f"| Full-text evidence chunks | {ev.get('chunks', 0)} |",
         f"| Sources with full text fetched | {ev.get('fetched_sources', 0)} |",
@@ -2208,16 +2222,38 @@ def _render_provenance_section(provenance: Dict) -> str:
     pruned = provenance.get("pruned_uncited") or []
     if pruned:
         lines.append(f"| Uncited sources pruned | {len(pruned)} |")
-    # Metrics that refuse to lie: relevance precision sits next to citation
-    # precision so a clean "1.0" can never again hide dead-weight sources;
-    # claim coverage below 0.6 gets an explicit warning, not a silent number.
+    # Metrics that refuse to lie: relevance precision exists ONLY when the
+    # embedding topical filter actually ran — run9's "1.0" was padding-only
+    # arithmetic printed beside an entire chronic-pain section. Unavailable
+    # embeddings ⇒ "not measurable", never a number. Borderline (starvation-
+    # rescued sub-floor) sources that got cited count against precision.
     rel_prec = provenance.get("relevance_precision")
+    rel_mode = provenance.get("relevance_precision_mode")
     if rel_prec is not None:
         lines.append(f"| Citation precision (structural) | {provenance.get('citation_precision', 'n/a')} |")
-        lines.append(f"| Relevance precision (topical, padding-aware) | {rel_prec} |")
+        label = (
+            "Relevance precision (topical, embedding-gated)"
+            if rel_mode == "embedding_topical"
+            else "Relevance precision (padding-aware)"
+        )
+        lines.append(f"| {label} | {rel_prec} |")
         pad_cited = provenance.get("padding_cited") or []
         if pad_cited:
             lines.append(f"| ⚠ Cited sources with zero discriminative overlap | {len(pad_cited)} ([S{'], [S'.join(str(x) for x in pad_cited)}]) |")
+        border_cited = provenance.get("borderline_cited") or []
+        if border_cited:
+            lines.append(
+                f"| ⚠ Cited sources below the embedding topical floor (starvation-rescued; topical fit unverified) | [S{'], [S'.join(str(x) for x in border_cited)}] |"
+            )
+    else:
+        lines.append(
+            "| Relevance precision (topical) | not measurable — embedding topical filter unavailable this run; lexical padding screen only |  |"
+        )
+    ed = provenance.get("evidence_depth") or {}
+    if ed and ed.get("fulltext_sources", 0) < (ed.get("floor") or 3):
+        lines.append(
+            f"| ⚠ Evidence depth below floor | {ed.get('fulltext_sources', 0)} full-text source(s) vs floor {ed.get('floor', 3)} — claims rest on titles/abstracts; established language is not supported |  |"
+        )
     cov = provenance.get("claim_coverage")
     if cov is not None and cov != "n/a":
         try:
@@ -2236,10 +2272,56 @@ def _render_provenance_section(provenance: Dict) -> str:
     resc = scr.get("floor_rescued") or []
     pad_drop = scr.get("padding_dropped") or []
     pruned_uncited = provenance.get("pruned_uncited") or []
-    if any([rej, resc, pad_drop, scr.get("junk_filtered"), pruned_uncited]):
+    top_rej = topical.get("rejected") or []
+    top_border = topical.get("borderline") or []
+    top_adj = topical.get("adjudicated") or []
+    if any([rej, resc, pad_drop, scr.get("junk_filtered"), pruned_uncited, top_rej, top_border,
+            top_adj, topical.get("mode") == "unavailable",
+            (topical.get("mode") == "embedding" and topical.get("anchor"))]):
         lines += ["", "Screening decisions (deterministic, auditable):"]
         if scr.get("junk_filtered"):
             lines.append(f"- Junk filter: {scr['junk_filtered']} non-paper records dropped (supplements, bare directories)")
+        if topical.get("anchor") and topical.get("mode") == "embedding":
+            kind = topical.get("kind") or "?"
+            lines.append(
+                f"- Topical anchor ({kind} — every source scored against it by embedding cosine, not keywords): "
+                f"“{(topical.get('anchor') or '')[:150]}”"
+            )
+            if topical.get("distractor"):
+                lines.append(
+                    f"- Topical distractor (sources closer to this than to the phenomenon are rejected): "
+                    f"“{(topical.get('distractor') or '')[:150]}”"
+                )
+        if topical.get("mode") == "unavailable":
+            lines.append(
+                "- Topical filter: UNAVAILABLE this run (embedding backend failed) — "
+                "topical fit NOT verified beyond the lexical padding screen"
+            )
+        if top_adj:
+            shown = "; ".join(
+                f"“{(a.get('title') or '')[:60]}” ({a.get('score')} → {a.get('verdict')})"
+                for a in top_adj[:5]
+            )
+            lines.append(
+                f"- Topical adjudication (LLM judgment on vector-borderline sources): {shown}"
+            )
+        if top_rej:
+            shown = "; ".join(
+                f"“{(r.get('title') or '')[:70]}” ({r.get('score')})"
+                for r in top_rej[:5]
+            )
+            lines.append(
+                f"- Embedding topical filter: rejected {len(top_rej)} below floor "
+                f"{topical.get('floor')}: {shown}"
+            )
+        if top_border:
+            shown = "; ".join(
+                f"“{(r.get('title') or '')[:70]}” ({r.get('score')})"
+                for r in top_border[:4]
+            )
+            lines.append(
+                f"- ⚠ Starvation-rescued below topical floor (pool would be empty — topical fit unverified): {shown}"
+            )
         if rej:
             shown = "; ".join(
                 f"“{(r.get('title') or '')[:70]}” ({r.get('relevance', 0)})"
@@ -2347,6 +2429,27 @@ async def generate_research_report(
     all_sources = dedup_sources_canonical(all_sources)
     funnel["post_dedup"] = len(all_sources)
     screening: Dict = {}  # deterministic screening-decision audit (provenance)
+
+    # ── Step 3.1: EMBEDDING TOPICAL FILTER (meaning, not keywords) ──
+    # run9 fatal defect: the CT.gov provider stamps "Results posted: NO" into
+    # every record snippet, so EVERY registry record carried the discriminative
+    # token "results" — and the lexical gate waved a chronic-pain ACT/CBT
+    # trial into a publication-bias report, where it became an entire
+    # section. Token overlap cannot judge topical fit; embeddings can.
+    # Honest degradation: if embeddings are unavailable NOTHING is dropped,
+    # screening["topical_mode"]="unavailable", and the metrics layer must
+    # then REFUSE to print a topical precision number (a lexical-only "1.0"
+    # is exactly the lie run9 printed next to its chronic-pain section).
+    try:
+        from agent.topical_filter import apply_topical_filter
+        pre_topical = len(all_sources)
+        all_sources = await apply_topical_filter(query, all_sources, screening=screening)
+        funnel["topical_dropped"] = pre_topical - len(all_sources)
+    except Exception as e:
+        logger.warning(f"Topical filter failed (non-fatal): {e}")
+        screening.setdefault("topical_mode", "unavailable")
+    funnel["post_topical"] = len(all_sources)
+
     all_sources = select_diverse_sources(
         all_sources,
         max_sources=28 if depth == "thorough" else 18,
@@ -2414,6 +2517,30 @@ async def generate_research_report(
     funnel["post_enrichment"] = len(all_sources)
     funnel["canonical_backfilled"] = len(backfilled_ids)
 
+    # ── Step 5.55: TOPICAL FILTER, PASS 2 (snowball/iterative additions) ──
+    # Sources added after pass 1 (snowballing, gap-filling cycles) never saw
+    # the embedding gate. Canonical-backfilled sources stay exempt — they
+    # were fetched BY DOI from the named-method registry (in-domain by
+    # construction) — and carry an explicit exemption justification so that
+    # EVERY accepted source keeps a one-line auditable reason.
+    try:
+        from agent.topical_filter import apply_topical_filter
+        backfilled_set = set(backfilled_ids)
+        protected = [s for s in all_sources if s.get("canonical_id") in backfilled_set]
+        for s in protected:
+            ex = s.setdefault("extra", {})
+            ex.setdefault("topical_ok", True)
+            ex.setdefault("topical_justification", "exempt: canonical backfill (registry-attested in-domain)")
+        judgeable = [s for s in all_sources if s.get("canonical_id") not in backfilled_set]
+        pre_topical2 = len(judgeable)
+        judged = await apply_topical_filter(
+            query, judgeable, screening=screening, select_new_only=True
+        )
+        all_sources = judged + protected
+        funnel["topical_dropped_pass2"] = pre_topical2 - len(judged)
+    except Exception as e:
+        logger.warning(f"Topical filter pass-2 failed (non-fatal): {e}")
+
     # ── Step 5.6: OFF-TOPIC PADDING DROP (deterministic, pre-draft) ──
     # Sources sharing NONE of the query's discriminative vocabulary cannot
     # be evidence about the question — citing them is padding (run8: RNA-seq
@@ -2461,6 +2588,15 @@ async def generate_research_report(
         corpus = EvidenceCorpus()
         ev_stats = {"chunks": 0, "fetched_sources": 0, "failed_sources": 0, "total_chars": 0, "semantic_scoring": False}
 
+    # Full-text depth for the evidence floor (run9 verdict fix 2): the count
+    # is factual at build time; only semantic_scoring is corrected post-draft.
+    fulltext_count_pre = 0
+    try:
+        from agent.evidence_fetcher import evidence_stats as _evstats
+        fulltext_count_pre = int((_evstats(corpus) or {}).get("fetched_sources", 0) or 0)
+    except Exception:
+        pass
+
     # ── Step 7: Claim extraction + verification (heuristic prefilter ⊕ NLI) ──
     claims = _extract_claims_from_sources(all_sources)
     verification = verify_claims_from_sources(claims, all_sources)
@@ -2479,7 +2615,8 @@ async def generate_research_report(
 
     # ── Step 9: PARALLEL SECTION DRAFTING ──
     draft_tasks = [
-        _draft_section(section, query, all_sources, corpus, verification, depth)
+        _draft_section(section, query, all_sources, corpus, verification, depth,
+                       fulltext_count=fulltext_count_pre)
         for section in outline
     ]
     draft_results = await asyncio.gather(*draft_tasks, return_exceptions=True)
@@ -2519,8 +2656,25 @@ async def generate_research_report(
     except Exception as e:
         logger.warning(f"Late canonical backfill failed (non-fatal): {e}")
 
+    # Evidence-depth enforcement (run9 verdict fix 2): with < 3 full-text
+    # sources, 'established/definitive/conclusive' language enters the
+    # revision feedback verbatim — the drafter reasoned from abstracts and
+    # must not dress that up as settled evidence.
+    established_issues: List[str] = []
+    try:
+        from agent.citation_integrity import scan_unfounded_established
+        for f in scan_unfounded_established(raw_report, fulltext_count_pre):
+            established_issues.append(
+                f"EVIDENCE_DEPTH: “{f['excerpt']}” — only {f['fulltext_count']} source(s) have fetched full text "
+                f"(floor {f['floor']}). Rewrite the sentence without established/definitive language and "
+                f"qualify the evidence as abstract-level."
+            )
+    except Exception as e:
+        logger.debug(f"Evidence-depth scan failed (non-fatal): {e}")
+
     raw_report, critique, revise_model = await _critique_and_revise(
-        raw_report, query, all_sources, depth, extra_issues=canonical_issues
+        raw_report, query, all_sources, depth,
+        extra_issues=canonical_issues + established_issues,
     )
     if revise_model:
         models_used.append(revise_model)
@@ -2560,10 +2714,15 @@ async def generate_research_report(
 
     # ── Step 10.55: RELEVANCE HONESTY (metrics that can't lie) ──
     # citation_precision counts numbering/decency, not topicality — run8's
-    # "1.0" sat next to two irrelevant sources. Relevance precision counts
-    # only citations whose source carries discriminative overlap with the
-    # question. Claim coverage below 0.6 becomes an explicit appendix line,
-    # never a silent number.
+    # "1.0" sat next to two irrelevant sources, and run9's sat next to an
+    # entire chronic-pain section. Two rules now hold:
+    #   1. Topical relevance precision is ONLY claimable when the embedding
+    #      filter actually ran (mode == "embedding"). Borderline (starvation-
+    #      rescued sub-floor) sources that got cited count against it.
+    #   2. When embeddings were unavailable, relevance_precision is None and
+    #      the renderer says "not measurable" — a lexical-only "1.0" is
+    #      structurally incapable of detecting topical drift and must never
+    #      be printed again.
     try:
         from agent.citation_integrity import scan_off_topic_padding as _sop
         from agent.citation_integrity import extract_numbered_citations as _enc
@@ -2573,14 +2732,39 @@ async def generate_research_report(
         cited_final = sorted(set(_enc(body_split[0])))
         padding_cited = {f["source"] for f in padding_final if f["source"] in cited_final}
         critique["padding_cited"] = sorted(padding_cited)
-        critique["relevance_precision"] = (
-            round(1.0 - len(padding_cited) / len(cited_final), 3)
-            if cited_final else None
-        )
+
+        topical_mode = (screening or {}).get("topical_mode")
+        critique["topical_mode"] = topical_mode
+        if topical_mode == "embedding":
+            sub_floor_cited = [
+                i for i in cited_final
+                if 0 < i <= len(all_sources)
+                and ((all_sources[i - 1].get("extra") or {}).get("topical_ok") is False)
+            ]
+            critique["borderline_cited"] = sorted(sub_floor_cited)
+            critique["relevance_precision"] = (
+                round(1.0 - len(sub_floor_cited) / len(cited_final), 3)
+                if cited_final else None
+            )
+            critique["relevance_precision_mode"] = "embedding_topical"
+        else:
+            critique["borderline_cited"] = []
+            critique["relevance_precision"] = None
+            critique["relevance_precision_mode"] = "unavailable"
+
+        # Post-revision evidence-depth check: did the 'established' language
+        # survive the revision pass on a sub-floor full-text base?
+        try:
+            from agent.citation_integrity import scan_unfounded_established as _sue
+            _ft = (ev_stats or {}).get("fetched_sources", 0) if ev_stats else 0
+            critique["established_flags_final"] = len(_sue(raw_report, _ft))
+        except Exception:
+            critique["established_flags_final"] = None
     except Exception as e:
         logger.debug(f"Relevance-honesty metrics failed (non-fatal): {e}")
         critique["padding_flags_final"] = None
         critique["relevance_precision"] = None
+        critique["relevance_precision_mode"] = "unavailable"
 
     # ── Step 10.6: PROVENANCE APPENDIX (deterministic audit trail) ──
     # PRISMA-style funnel rendered from pipeline counters — nothing after
@@ -2613,8 +2797,31 @@ async def generate_research_report(
             "pruned_uncited": prune_stats.get("pruned", []),
             "citation_precision": critique.get("citation_precision"),
             "relevance_precision": critique.get("relevance_precision"),
+            "relevance_precision_mode": critique.get("relevance_precision_mode"),
+            "borderline_cited": critique.get("borderline_cited", []),
             "padding_cited": critique.get("padding_cited", []),
             "claim_coverage": critique.get("claim_coverage"),
+            "topical": {
+                "mode": (screening or {}).get("topical_mode"),
+                "floor": (screening or {}).get("topical_floor"),
+                "anchor": (screening or {}).get("topical_anchor"),
+                "kind": ((screening or {}).get("topical_anchors") or {}).get("kind"),
+                "distractor": ((screening or {}).get("topical_anchors") or {}).get("distractor"),
+                "dropped": (
+                    (funnel.get("topical_dropped", 0) or 0)
+                    + (funnel.get("topical_dropped_pass2", 0) or 0)
+                ),
+                "rejected": (screening or {}).get("topical_rejected", []),
+                "adjudicated": (screening or {}).get("topical_adjudicated", []),
+                "borderline": (screening or {}).get("topical_borderline", []),
+            },
+            "evidence_depth": {
+                "fulltext_sources": (
+                    (ev_stats or {}).get("fetched_sources", 0) if ev_stats else 0
+                ),
+                "floor": 3,
+                "established_flags_final": critique.get("established_flags_final"),
+            },
             "screening": {
                 "relevance_kept": screening.get("relevance_kept"),
                 "relevance_rejected": screening.get("relevance_rejected", []),

@@ -2199,9 +2199,16 @@ class TestMetricsHonestyRenderer:
     }
 
     def test_both_precisions_rendered(self):
-        md = _render_provenance_section(self.PROV)
+        # run9-verdict fix 3: a bare 1.0 is only claimable when the embedding
+        # topical filter actually ran (mode label says so); without it the
+        # renderer prints "not measurable" instead of a number.
+        prov = dict(self.PROV, relevance_precision_mode="embedding_topical")
+        md = _render_provenance_section(prov)
         assert "| Citation precision (structural) | 1.0 |" in md
-        assert "| Relevance precision (topical, padding-aware) | 1.0 |" in md
+        assert "| Relevance precision (topical, embedding-gated) | 1.0 |" in md
+        md2 = _render_provenance_section(dict(self.PROV, relevance_precision=None,
+                                              relevance_precision_mode="unavailable"))
+        assert "not measurable" in md2
 
     def test_low_claim_coverage_warns(self):
         md = _render_provenance_section(self.PROV)
@@ -2282,3 +2289,382 @@ class TestClinicalTrialsLane:
         monkeypatch.delenv("APEX_WEB_SEED_URLS", raising=False)
         sources, stats = asyncio.run(_web_sources_for_report(QUERY_TRIALS, [], "quick"))
         assert sources == [] and stats.get("registry_records") is None
+
+
+# ═══════════════════════════════════════════════════════════════
+# Run9-verdict fix 1: embedding topical filter
+# ═══════════════════════════════════════════════════════════════
+
+
+def _topic_embed_double(scored_texts, default_score=0.30, default_dist=0.30, dim=64):
+    """Deterministic embed double with EXACT geometry.
+
+    scored_texts: list of (substring, phenomenon_cosine, distractor_cosine).
+    A text is assigned (p, d) by its first matching substring, else defaults.
+    The phenomenon anchor embeds to axis 0 (unit), the distractor to axis 1,
+    so cos(anchor, src) = p and cos(distractor, src) = d exactly:
+        src = [p, d, sqrt(1 - p^2 - d^2), 0...]
+    No network, fully deterministic.
+    """
+    import math
+
+    def vec_for(text, anchor_is_axis0=False, axis=0):
+        if anchor_is_axis0:
+            v = [0.0] * dim
+            v[0] = 1.0
+            return v
+        if axis == 1:
+            v = [0.0] * dim
+            v[1] = 1.0
+            return v
+        p, d = default_score, default_dist
+        for sub, sp, sd in scored_texts:
+            if sub.lower() in text.lower():
+                p, d = sp, sd
+                break
+        rest = max(0.0, 1.0 - p * p - d * d) ** 0.5
+        v = [0.0] * dim
+        v[0] = p
+        v[1] = d
+        v[2] = rest
+        return v
+
+    async def embed_fn(texts):
+        # First text is the phenomenon anchor, subsequent ones are
+        # distractor candidates — mirrors apply_topical_filter's batching.
+        out = []
+        for i, txt in enumerate(texts):
+            if i == 0:
+                out.append(vec_for(txt, anchor_is_axis0=True))
+            elif txt.startswith(("An ordinary primary study", "Ordinary primary")):
+                out.append(vec_for(txt, axis=1))
+            else:
+                out.append(vec_for(txt))
+        return out
+
+    return embed_fn
+
+
+PHEN_WORDS = ["publication bias", "unreported", "never reported", "missing results",
+              "reporting bias", "unpublished"]
+JUNK_WORDS = ["chronic pain", "behavioral therapy", "pain interference"]
+
+
+def _mk_sources():
+    return [
+        {
+            "url": "https://example.org/nordic",
+            "title": "Nordic countries: 475 clinical trials with missing results",
+            "snippet": "Registry audit of unreported trials: 475 trials never reported results.",
+            "tier": "P1", "extra": {},
+        },
+        {
+            "url": "https://clinicaltrials.gov/study/NCT02778737",
+            "title": "Acceptance and Commitment Therapy versus CBT for chronic pain",
+            # the run9 poison: the provider stamps "Results posted: NO" into
+            # every snippet, which is exactly how it rode the lexical gate
+            "snippet": "Status: COMPLETED. Results posted: NO. Randomized trial of behavioral therapy; primary outcome pain interference.",
+            "tier": "P1", "extra": {},
+        },
+        {
+            "url": "https://example.org/egger",
+            "title": "Bias in meta-analysis detected by a simple graphical test",
+            "snippet": "Funnel plot asymmetry methods for detecting publication bias in unreported trials.",
+            "tier": "P1", "extra": {},
+        },
+    ]
+
+
+ANCHORS_STUB = {
+    "phenomenon": "Publication bias: clinical trials whose results were never reported",
+    "distractor": "Ordinary primary studies reporting their own findings",
+    "kind": "phenomenon",
+}
+
+# Exact scores: egger clearly on-topic; nordic just below the typical floor
+# (band member — adjudication territory); chronic pain sub-floor with a
+# distractor score inside the contrast band (the run9 poison shape).
+EMBED_SCORES = [
+    ("Nordic countries", 0.62, 0.30),
+    ("Bias in meta-analysis", 0.80, 0.25),
+    ("chronic pain", 0.45, 0.47),
+]
+
+
+class TestTopicalFilter:
+    def test_rejects_off_topic_that_shares_vocabulary(self):
+        """run9 regression: a chronic-pain trial with 'Results posted: NO'
+        boilerplate must be rejected even though its snippet shares the
+        token 'results' with the question."""
+        from agent.topical_filter import apply_topical_filter
+        srcs = _mk_sources()
+        scr = {}
+        embed_fn = _topic_embed_double(EMBED_SCORES)
+        kept = asyncio.run(apply_topical_filter(
+            "Meta-analysis of unpublished negative-result trials never reported",
+            srcs, screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_adj_relevant_unless_junk,
+        ))
+        titles = {s["title"] for s in kept}
+        assert any("Nordic" in t for t in titles)      # band-rescued by LLM judge
+        assert not any("chronic pain" in t for t in titles)
+        rej = scr.get("topical_rejected") or []
+        assert any("chronic pain" in r["title"] for r in rej)
+        assert all(r["justification"] for r in rej)
+        assert any(a["verdict"] == "off_topic" and "chronic pain" in a["title"]
+                   for a in scr.get("topical_adjudicated") or [])
+
+    def test_every_kept_source_has_justification(self):
+        from agent.topical_filter import apply_topical_filter
+        srcs = _mk_sources()
+        embed_fn = _topic_embed_double(EMBED_SCORES)
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", srcs,
+            screening={}, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_adj_relevant_unless_junk,
+        ))
+        assert kept
+        for s in kept:
+            ex = s.get("extra") or {}
+            assert ex.get("topical_justification"), s["title"]
+            assert ex.get("topical_score") is not None
+            assert ex.get("topical_ok") is True
+
+    def test_unavailable_mode_drops_nothing_and_marks_screening(self):
+        """Honest degradation: no embeddings → nothing dropped, mode marked,
+        and NO topical score is faked."""
+        from agent.topical_filter import apply_topical_filter
+
+        async def boom(texts):
+            raise RuntimeError("CF neurons exhausted")
+
+        srcs = _mk_sources()
+        scr = {}
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials", srcs, screening=scr,
+            embed_fn=boom, anchors=ANCHORS_STUB,
+        ))
+        assert len(kept) == len(srcs)
+        assert scr["topical_mode"] == "unavailable"
+        assert "topical_rejected" not in scr
+
+    def test_starvation_valve_marks_borderline(self):
+        """If EVERYTHING is off-topic, top-3 are rescued with borderline
+        flags — visible, not silent."""
+        from agent.topical_filter import apply_topical_filter
+        srcs = [
+            {"url": f"https://x/{i}", "title": f"Chronic pain study {i}",
+             "snippet": "behavioral therapy outcomes for pain interference",
+             "tier": "P1", "extra": {}}
+            for i in range(5)
+        ]
+        scr = {}
+        embed_fn = _topic_embed_double([])   # no vocabulary matches anywhere
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", srcs,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_async_false,
+        ))
+        assert len(kept) == 3
+        for s in kept:
+            assert s["extra"]["topical_ok"] is False
+            assert s["extra"]["topical_borderline"] is True
+            assert "STARVATION-RESCUED" in s["extra"]["topical_justification"]
+        assert len(scr.get("topical_borderline") or []) == 3
+
+    def test_adjudication_rescues_borderline_gold(self):
+        """A gold source just below the floor is rescued by the LLM
+        adjudicator and the arbitration is logged."""
+        from agent.topical_filter import apply_topical_filter
+        srcs = _mk_sources()
+        # nordic sits just below the floor (0.62 vs 0.656) — band member
+        embed_fn = _topic_embed_double(EMBED_SCORES)
+        scr = {}
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", srcs,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_async_true,
+        ))
+        titles = {s["title"] for s in kept}
+        assert any("Nordic" in t for t in titles)
+        adj = scr.get("topical_adjudicated") or []
+        assert any(a["verdict"] == "relevant" for a in adj)
+        rescued = [s for s in kept if "Nordic" in s["title"]][0]
+        assert rescued["extra"]["topical_adjudicated"] is True
+        assert "LLM adjudicated RELEVANT" in rescued["extra"]["topical_justification"]
+
+    def test_adjudication_confirms_borderline_junk_rejection(self):
+        from agent.topical_filter import apply_topical_filter
+        srcs = _mk_sources()
+        embed_fn = _topic_embed_double(EMBED_SCORES)
+        scr = {}
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", srcs,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_async_false,
+        ))
+        assert not any("chronic pain" in s["title"] for s in kept)
+        adj = scr.get("topical_adjudicated") or []
+        assert any(a["verdict"] == "off_topic" and "chronic pain" in a["title"] for a in adj)
+
+    def test_pass2_reuses_anchors_and_annotates_survivors(self):
+        from agent.topical_filter import apply_topical_filter
+        embed_fn = _topic_embed_double(EMBED_SCORES)
+        base = _mk_sources()
+        scr = {}
+        kept1 = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", base,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_adj_relevant_unless_junk,
+        ))
+        new_src = [{"url": "https://x/new", "title": "Pain clinic outcomes",
+                    "snippet": "chronic pain behavioral therapy", "tier": "P1", "extra": {}}]
+        scr2 = dict(scr)
+        kept2 = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported",
+            kept1 + new_src,
+            screening=scr2, embed_fn=embed_fn, select_new_only=True,
+            adjudicate_fn=_async_false,
+        ))
+        # pass-1 survivors untouched, new junk rejected, anchors not re-asked
+        assert {s["title"] for s in kept1} <= {s["title"] for s in kept2}
+        assert not any("Pain clinic" in s["title"] for s in kept2)
+        assert scr2["topical_anchors"] == ANCHORS_STUB
+
+
+async def _async_true(*a, **k):
+    return True
+
+
+async def _async_false(*a, **k):
+    return False
+
+
+async def _adj_relevant_unless_junk(query, phen, dist, src):
+    """Mirror of the live GLM adjudicator: YES for evidence about the
+    phenomenon (audits/methods), NO for ordinary subject-area studies."""
+    return "chronic pain" not in (src.get("title") or "").lower()
+
+
+# ═══════════════════════════════════════════════════════════════
+# Run9-verdict fix 2: evidence-depth floor
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestEvidenceDepthFloor:
+    def test_established_flagged_below_floor(self):
+        from agent.citation_integrity import scan_unfounded_established
+        text = (
+            "## EVIDENCE\n\nIt is well established that reporting bias "
+            "distorts meta-analytic estimates.\n"
+        )
+        flags = scan_unfounded_established(text, fulltext_count=1)
+        assert len(flags) == 1
+        assert "well established" in flags[0]["reason"]
+        assert flags[0]["fulltext_count"] == 1 and flags[0]["floor"] == 3
+
+    def test_clean_at_or_above_floor(self):
+        from agent.citation_integrity import scan_unfounded_established
+        text = "## EVIDENCE\n\nIt is well established that reporting bias exists.\n"
+        assert scan_unfounded_established(text, fulltext_count=3) == []
+        assert scan_unfounded_established(text, fulltext_count=5) == []
+
+    def test_headings_and_tables_not_flagged(self):
+        from agent.citation_integrity import scan_unfounded_established
+        text = (
+            "## ESTABLISHED FINDINGS\n\n"
+            "| Metric | Established value |\n"
+            "|---|---|\n"
+        )
+        assert scan_unfounded_established(text, fulltext_count=0) == []
+
+    def test_definitive_language_flagged(self):
+        from agent.citation_integrity import scan_unfounded_established
+        text = "The evidence definitively shows no effect.\n"
+        flags = scan_unfounded_established(text, fulltext_count=1)
+        assert len(flags) == 1
+
+    def test_renderer_evidence_depth_warning(self):
+        provenance = {
+            "final_sources": 5,
+            "identified_records": 10,
+            "post_dedup": 9,
+            "post_selection": 5,
+            "evidence": {"chunks": 3, "fetched_sources": 1, "total_chars": 100,
+                         "semantic_scoring": False},
+            "citation_precision": 1.0,
+            "claim_coverage": 0.8,
+            "relevance_precision": None,
+            "relevance_precision_mode": "unavailable",
+            "evidence_depth": {"fulltext_sources": 1, "floor": 3,
+                               "established_flags_final": 0},
+            "topical": {"mode": "embedding", "floor": 0.66,
+                        "anchor": "Publication bias: trials never reported",
+                        "kind": "phenomenon",
+                        "distractor": "Ordinary primary studies",
+                        "dropped": 2, "rejected": [], "adjudicated": [],
+                        "borderline": []},
+            "screening": {},
+            "queries": ["q"],
+        }
+        md = _render_provenance_section(provenance)
+        assert "Evidence depth below floor" in md
+        assert "not measurable" in md
+        assert "Topical anchor" in md
+
+
+# ═══════════════════════════════════════════════════════════════
+# Run9-verdict fix 3: metrics honesty rendering
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestTopicalMetricsRenderer:
+    def _prov(self, rel_prec, mode, border_cited=None):
+        return {
+            "final_sources": 4,
+            "identified_records": 9,
+            "post_dedup": 8,
+            "post_selection": 4,
+            "evidence": {"chunks": 5, "fetched_sources": 3, "total_chars": 900,
+                         "semantic_scoring": True},
+            "citation_precision": 1.0,
+            "claim_coverage": 0.9,
+            "relevance_precision": rel_prec,
+            "relevance_precision_mode": mode,
+            "borderline_cited": border_cited or [],
+            "evidence_depth": {"fulltext_sources": 3, "floor": 3,
+                               "established_flags_final": 0},
+            "topical": {"mode": "embedding", "floor": 0.66,
+                        "anchor": "Publication bias: trials never reported",
+                        "kind": "phenomenon", "distractor": None,
+                        "dropped": 1,
+                        "rejected": [{"title": "Chronic pain trial",
+                                      "score": 0.54,
+                                      "justification": "phenomenon cosine 0.54 < floor 0.66"}],
+                        "adjudicated": [{"title": "Audit of registries",
+                                         "score": 0.65, "verdict": "relevant"}],
+                        "borderline": []},
+            "screening": {"junk_filtered": 1},
+            "queries": ["q"],
+        }
+
+    def test_embedding_mode_precision_label(self):
+        md = _render_provenance_section(self._prov(1.0, "embedding_topical"))
+        assert "Relevance precision (topical, embedding-gated) | 1.0" in md
+
+    def test_unavailable_mode_never_claims_precision(self):
+        md = _render_provenance_section(self._prov(None, "unavailable"))
+        assert "not measurable" in md
+        assert "Relevance precision (topical, embedding-gated) | 1.0" not in md
+
+    def test_borderline_cited_warning(self):
+        md = _render_provenance_section(self._prov(0.75, "embedding_topical", [3]))
+        assert "below the embedding topical floor" in md
+        assert "[S3]" in md
+
+    def test_screening_audit_renders_anchor_and_adjudication(self):
+        md = _render_provenance_section(self._prov(1.0, "embedding_topical"))
+        assert "Topical anchor (phenomenon" in md
+        assert "Topical adjudication" in md
+        assert "relevant" in md
+        assert "Embedding topical filter: rejected 1" in md
