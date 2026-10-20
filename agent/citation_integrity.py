@@ -631,7 +631,21 @@ _STRUCTURAL_REASON_RE = re.compile(
     r"|cannot be enumerated|not systematically (?:recorded|captured|collected|indexed)"
     r"|no systematic record|no (?:way|method) to (?:enumerate|identify|count|locate|retrieve)"
     r"|hidden (?:population|fraction)|no (?:such )?(?:database|registry|index|denominator)"
-    r"|no exhaustive|inherently (?:unknowable|unmeasurable|unobservable)",
+    r"|no exhaustive|inherently (?:unknowable|unmeasurable|unobservable)"
+    # Data-availability family (run8 regression): the structural reason for
+    # never-published-trial questions is that the DATA exists in no
+    # retrievable form — registries record existence, not effect sizes.
+    # LLM-drafted scopes state this as "without access to the individual
+    # participant data", "registries rarely contain the detailed effect size
+    # data", "<noun> data ... unavailable/inaccessible". Recognize these
+    # without opening the door to generic "not found in our search" hedges:
+    # each marker requires an access/data noun phrase, not a bare negative.
+    r"|without access to (?:the |any |its )?(?:raw|individual|underlying|effect|outcome|patient|source)"
+    r"|no access to (?:the |any )?(?:raw|individual|underlying|effect|outcome|patient|source)"
+    r"|(?:rarely|seldom) contain"
+    r"|(?:raw|individual participant|patient-level|individual-level|underlying|source|effect.size|outcome|effect)"
+    r"[\w\s,()-]{0,80}\b(?:unavailable|inaccessible|cannot be (?:retrieved|obtained|accessed|extracted))"
+    ,
     re.I,
 )
 

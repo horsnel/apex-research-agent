@@ -406,7 +406,29 @@ async def _call_cloudflare(
     base_url = get_cloudflare_base_url()
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        # CF Workers AI under load: large drafting prompts (full evidence
+        # corpus, 2-8k output tokens) can exceed 30s per call on ANY chain
+        # model — live run8 saw all 5 report-tier models time out at 30s
+        # on one call. 180s covers 70B drafting at ~20-30 tok/s while
+        # still bounding worst-case fall-through latency.
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            # Thinking-capable models (@cf/zai-org/glm-4.7-flash, Qwen3 MoE)
+            # spend the token budget on hidden reasoning BEFORE content — at
+            # small max_tokens (classification/variants/critique calls run at
+            # 100-200) content comes back empty and the call falls through
+            # the whole chain. chat_template_kwargs.enable_thinking=False is
+            # the vLLM-style passthrough that CF honors for GLM-4.7-Flash
+            # (verified live: completion_tokens 120→6 on a 120-token probe);
+            # non-thinking models (Llama/Granite/Mistral) ignore it —
+            # verified live 200s with normal output.
+            json_body = {
+                "model": model_id,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            if "glm" in model_id.lower() or "qwen" in model_id.lower():
+                json_body["chat_template_kwargs"] = {"enable_thinking": False}
             # Transient empty responses (observed live on Qwen3/Llama under
             # burst load): retry the SAME model once after a short backoff
             # before falling through to the next model in the chain.
@@ -417,12 +439,7 @@ async def _call_cloudflare(
                         "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
                         "Content-Type": "application/json",
                     },
-                    json={
-                        "model": model_id,
-                        "messages": messages,
-                        "max_tokens": max_tokens,
-                        "temperature": temperature,
-                    },
+                    json=json_body,
                 )
                 latency = int((time.time() - start) * 1000)
 

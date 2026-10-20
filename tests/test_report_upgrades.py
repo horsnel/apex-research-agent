@@ -10,6 +10,7 @@ Run: pytest tests/test_report_upgrades.py -v
 """
 
 import asyncio
+import json
 import os
 import sys
 
@@ -1443,6 +1444,82 @@ class TestWebSourcesForReport:
         assert stats["available"] is False and stats["enabled"] is True
 
 
+class TestWebSeedFallback:
+    """Operator-attested seed URLs substitute for dead live search — same
+    governance stack, honest seeded=True labeling, live mode untouched."""
+
+    SEEDS = [
+        {"url": "https://www.transparimed.org/single-post/nordic-trials?utm_source=x",
+         "title": "Nordic countries: 475 clinical trials missing results",
+         "snippet": "475 trials, 83,903 patients, Rigshospitalet 23%"},
+        {"url": "https://spamblog.xyz/cheap-drugs", "title": "Cheap drugs", "snippet": "spam"},
+    ]
+
+    def test_seeds_enter_through_governance_when_live_dead(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead(query, num):
+            return []
+
+        monkeypatch.setattr(ts, "search_zai_web", dead)
+        monkeypatch.setenv("APEX_WEB_SEARCH", "true")
+        monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
+        sources, stats = asyncio.run(_web_sources_for_report("q words", ["v"], "thorough"))
+        assert stats["available"] is False
+        assert stats["search_mode"] == "seeded_fallback"
+        assert stats["seeded"] == 1  # DROP-tier spam filtered
+        assert stats["results"] == 0  # live search contributed nothing
+        assert len(sources) == 1
+        s = sources[0]
+        assert s["url"] == "https://www.transparimed.org/single-post/nordic-trials"  # canonicalized
+        assert s["tier"] == "P2"  # grey-literature governance
+        assert s["source_name"] == "web_seed"
+        assert s["extra"]["web"] is True and s["extra"]["seeded"] is True
+
+    def test_live_results_leave_seeds_unused(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def alive(query, num):
+            return [SearchResult(
+                title="Live hit", url="https://example.org/live-hit",
+                snippet="s", source_name="zai_web", source_category=SourceCategory.WEB,
+                source_tier="P3", extra={"web": True},
+            )]
+
+        monkeypatch.setattr(ts, "search_zai_web", alive)
+        monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
+        sources, stats = asyncio.run(_web_sources_for_report("q words", [], "quick"))
+        assert stats["search_mode"] == "live"
+        assert "seeded" not in stats
+        assert len(sources) == 1 and sources[0]["url"].endswith("live-hit")
+
+    def test_malformed_seed_json_ignored(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead(query, num):
+            return []
+
+        monkeypatch.setattr(ts, "search_zai_web", dead)
+        monkeypatch.setenv("APEX_WEB_SEED_URLS", "{not json")
+        sources, stats = asyncio.run(_web_sources_for_report("q", [], "quick"))
+        assert sources == [] and stats.get("seeded") in (None, 0)
+
+    def test_provenance_renderer_labels_seeded_fallback(self):
+        prov = {
+            "identified_records": 30, "post_dedup": 20, "post_selection": 10,
+            "post_enrichment": 12, "canonical_backfilled": 5, "final_sources": 12,
+            "web_records_kept": 2, "web_seeded": 2, "web_search_mode": "seeded_fallback",
+        }
+        section = _render_provenance_section(prov)
+        assert "| Web records from seeded fallback (live search unavailable) | 2 |" in section
+        assert "| Web retrieval mode | seeded_fallback |" in section
+        # live mode line renders too, seeded line absent
+        prov2 = dict(prov, web_seeded=0, web_search_mode="live")
+        section2 = _render_provenance_section(prov2)
+        assert "seeded fallback" not in section2
+        assert "| Web retrieval mode | live |" in section2
+
+
 class TestEvidenceWebDispatch:
     def test_web_record_routes_to_page_reader(self, monkeypatch):
         import tools.search_sources as ts
@@ -1839,6 +1916,47 @@ class TestScopeDodgeScan:
 
     def test_missing_scope_section_passes(self):
         assert scan_scope_dodge("# T\n\n## FINDINGS\n\nbody") == []
+
+    # ── run8 regression: live GLM draft carried a REAL structural argument
+    # in data-availability phrasing; the marker list did not recognize it
+    # and flagged an honest scope section. The report's own paragraphs:
+    RUN8_SCOPE = (
+        "# T\n\n## SCOPE & EVIDENCE BASE\n\n"
+        "The analysis is constrained to the *existence* and *impact* of "
+        "unpublished trials, specifically negative-result studies, utilizing "
+        "publication-bias detection methods rather than a direct meta-analysis "
+        "of the missing data.\n\n"
+        "Despite these documented instances of missing data, a direct "
+        "meta-analysis of unpublished negative-result trials is methodologically "
+        "infeasible with the current evidence base. The primary barrier is the "
+        "inaccessibility of the raw data from unpublished studies. While "
+        "registries can identify that a trial exists, they rarely contain the "
+        "detailed effect size data required for a quantitative synthesis. "
+        "Without access to the individual participant data or at least the full "
+        "effect sizes and variances from unpublished trials, a direct "
+        "meta-analysis cannot be performed.\n\n## FINDINGS\n\nbody"
+    )
+
+    def test_run8_data_availability_scope_passes(self):
+        assert scan_scope_dodge(self.RUN8_SCOPE) == []
+
+    def test_data_availability_marker_variants(self):
+        for phrase in (
+            "cannot be performed: without access to the raw trial data, no "
+            "synthesis is possible",
+            "cannot be performed: registries rarely contain outcome data",
+            "cannot be performed: individual participant data unavailable",
+            "cannot be performed: the underlying data are inaccessible",
+        ):
+            doc = f"# T\n\n## SCOPE & EVIDENCE BASE\n\nA direct meta-analysis {phrase}.\n\n## FINDINGS\n\nbody"
+            assert scan_scope_dodge(doc) == [], phrase
+
+    def test_generic_hedge_still_flags_after_marker_expansion(self):
+        # The expansion must not open the door to "we didn't find it" hedges.
+        doc = ("# T\n\n## SCOPE & EVIDENCE BASE\n\nA direct meta-analysis cannot be "
+               "performed with the evidence retrieved here; the relevant studies "
+               "were not found in our search.\n\n## FINDINGS\n\nbody")
+        assert len(scan_scope_dodge(doc)) == 1
 
 
 class TestProvenanceAppendix:

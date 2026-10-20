@@ -31,6 +31,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -1144,6 +1145,29 @@ def _web_query_rewrite(query: str, max_words: int = 8) -> str:
     return " ".join(out)
 
 
+def _load_web_seed_urls() -> List[Dict]:
+    """Operator-attested fallback URLs for grey-literature retrieval.
+
+    Read from APEX_WEB_SEED_URLS (JSON list of {url,title,snippet,
+    published_date}). Used ONLY when live web search returns zero usable
+    hits; every seed still passes the same governance stack as live hits
+    (canonicalization, DROP filter, tier enforcement, junk + relevance
+    gates) and is labeled seeded=True for the provenance appendix.
+    Malformed entries are skipped, never raised.
+    """
+    raw = os.getenv("APEX_WEB_SEED_URLS", "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"APEX_WEB_SEED_URLS is not valid JSON, ignoring: {e}")
+        return []
+    if not isinstance(data, list):
+        return []
+    return [d for d in data if isinstance(d, dict) and d.get("url")]
+
+
 async def _web_sources_for_report(
     query: str,
     variants: List[str],
@@ -1232,6 +1256,44 @@ async def _web_sources_for_report(
 
     stats["results"] = len(flat)
     stats["available"] = ok_queries > 0
+
+    # ── SEED FALLBACK (provider redundancy, honest labeling) ──
+    # When live web search yields nothing (bridge down, upstream 429, egress
+    # blocked), operator-attested VERIFIED grey-literature URLs from
+    # APEX_WEB_SEED_URLS (JSON list of {url,title,snippet,published_date})
+    # enter the SAME governance stack — canonicalization, domain-tier
+    # enforcement, DROP filtering, junk + relevance gates — and are marked
+    # seeded=True in both stats and the record's extra block, so the
+    # provenance appendix can state that live search was unavailable and
+    # seeds were used. A dead search engine never fabricates results; it
+    # only substitutes attested URLs for discovered ones.
+    if not flat:
+        seeds = _load_web_seed_urls()
+        for seed in seeds:
+            try:
+                from tools.search_sources import canonicalize_web_url, _web_result_tier
+                url = canonicalize_web_url(str(seed.get("url") or ""))
+                if not url or url in seen:
+                    continue
+                tier = _web_result_tier(url)
+                if tier == "DROP":
+                    continue
+                seen.add(url)
+                flat.append(SimpleNamespace(
+                    url=url,
+                    title=re.sub(r"\s+", " ", str(seed.get("title") or url)).strip()[:300],
+                    snippet=str(seed.get("snippet") or "")[:600],
+                    source_name="web_seed",
+                    source_tier=tier,
+                    published_date=seed.get("published_date") or "",
+                    extra={"web": True, "seeded": True},
+                ))
+            except Exception as e:
+                logger.debug(f"Seed URL {seed.get('url', '?')!r} rejected: {e}")
+        stats["seeded"] = len(flat)
+        stats["search_mode"] = "seeded_fallback" if flat else "unavailable"
+    else:
+        stats["search_mode"] = "live"
 
     out: List[Dict] = []
     for r in flat:
@@ -2035,6 +2097,12 @@ def _render_provenance_section(provenance: Dict) -> str:
         lines.append(f"| Final pool by source tier | {tier_str} |")
     if provenance.get("web_records_kept"):
         lines.append(f"| Grey-literature web records in final pool | {provenance.get('web_records_kept')} |")
+    if provenance.get("web_seeded"):
+        lines.append(
+            f"| Web records from seeded fallback (live search unavailable) | {provenance.get('web_seeded')} |"
+        )
+    if provenance.get("web_search_mode") and provenance.get("web_search_mode") != "off":
+        lines.append(f"| Web retrieval mode | {provenance.get('web_search_mode')} |")
     lines += [
         f"| Full-text evidence chunks | {ev.get('chunks', 0)} |",
         f"| Sources with full text fetched | {ev.get('fetched_sources', 0)} |",
@@ -2344,6 +2412,10 @@ async def generate_research_report(
             "web_records_kept": sum(
                 1 for s in all_sources if (s.get("extra") or {}).get("web")
             ),
+            "web_seeded": sum(
+                1 for s in all_sources if (s.get("extra") or {}).get("seeded")
+            ),
+            "web_search_mode": (web_stats or {}).get("search_mode", "off"),
             "evidence": ev_stats,
             "queries": [query] + [
                 v for v in variants if v.strip().lower() != query.strip().lower()
