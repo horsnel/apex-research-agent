@@ -1454,9 +1454,12 @@ class TestWebSourcesForReport:
         assert stats["available"] is False and stats["enabled"] is True
 
 
-class TestWebSeedFallback:
-    """Operator-attested seed URLs substitute for dead live search — same
-    governance stack, honest seeded=True labeling, live mode untouched."""
+class TestWebSeedUnion:
+    """run11 redesign: operator-attested seed URLs are a STANDING union with
+    live discovery (not a dead-search fallback) — run11's live search worked
+    yet missed the Nordic anchor page, and the topic-critical empirics
+    vanished. Seeds flow through the SAME governance stack in every mode and
+    the mix is labeled honestly."""
 
     SEEDS = [
         {"url": "https://www.transparimed.org/single-post/nordic-trials?utm_source=x",
@@ -1490,7 +1493,7 @@ class TestWebSeedFallback:
         assert s["source_name"] == "web_seed"
         assert s["extra"]["web"] is True and s["extra"]["seeded"] is True
 
-    def test_live_results_leave_seeds_unused(self, monkeypatch):
+    def test_live_results_union_with_attested_seeds(self, monkeypatch):
         import tools.search_sources as ts
 
         async def alive(query, num):
@@ -1507,9 +1510,42 @@ class TestWebSeedFallback:
         monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
         monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
         sources, stats = asyncio.run(_web_sources_for_report("q words", [], "quick"))
+        # the mix is honest: live succeeded AND the attested anchor entered
+        assert stats["search_mode"] == "live+attested_seeds"
+        assert stats["seeded"] == 1  # spam DROP-filtered, anchor kept
+        urls = {s["url"] for s in sources}
+        assert any(u.endswith("live-hit") for u in urls)
+        assert "https://www.transparimed.org/single-post/nordic-trials" in urls
+        seeded = [s for s in sources if s.get("extra", {}).get("seeded")]
+        assert len(seeded) == 1 and seeded[0]["source_name"] == "web_seed"
+
+    def test_live_seed_url_dedup_no_double_entry(self, monkeypatch):
+        """If live search independently discovers the seeded URL, the seed
+        must not add a duplicate record."""
+        import tools.search_sources as ts
+
+        live_url = "https://www.transparimed.org/single-post/nordic-trials"
+
+        async def alive(query, num):
+            return [SearchResult(
+                title="Nordic (live)", url=live_url + "?utm_campaign=live",
+                snippet="live discovery", source_name="zai_web",
+                source_category=SourceCategory.WEB, source_tier="P2",
+                extra={"web": True},
+            )]
+
+        async def dead_registry(query, max_results=8):
+            raise ConnectionError("registry down")
+
+        monkeypatch.setattr(ts, "search_zai_web", alive)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
+        monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
+        sources, stats = asyncio.run(_web_sources_for_report("q words", [], "quick"))
+        nordic = [s for s in sources if "nordic-trials" in s["url"]]
+        assert len(nordic) == 1
+        # live discovery wins the attribution; the seed deduped away
+        assert stats["seeded"] == 0
         assert stats["search_mode"] == "live"
-        assert "seeded" not in stats
-        assert len(sources) == 1 and sources[0]["url"].endswith("live-hit")
 
     def test_malformed_seed_json_ignored(self, monkeypatch):
         import tools.search_sources as ts
@@ -1562,9 +1598,11 @@ class TestEvidenceWebDispatch:
 
         source = {"url": "https://www.transparimed.org/single-post/nordic-trials",
                   "source_name": "zai_web", "extra": {"web": True}}
-        text = asyncio.run(fetch_source_fulltext(source))
+        text, attempts = asyncio.run(fetch_source_fulltext(source))
         assert called["page_reader"] == 1
         assert len(text) > 500
+        # route diagnostics must record the page_reader success
+        assert any(a["strategy"] == "page_reader" and a["ok"] for a in attempts)
 
     def test_non_web_record_skips_page_reader(self, monkeypatch):
         import tools.search_sources as ts
@@ -1580,8 +1618,9 @@ class TestEvidenceWebDispatch:
         monkeypatch.setattr(ts, "fetch_page_text", fake_page_text)
         monkeypatch.setattr(ls, "_scrape_url_with_fallback", fake_scrape)
 
-        source = {"url": "https://arxiv.org/abs/2411.10971", "source_name": "arxiv"}
-        assert asyncio.run(fetch_source_fulltext(source)) == ""
+        source = {"url": "https://example.org/papers/2411.10971", "source_name": "web"}
+        text, _attempts = asyncio.run(fetch_source_fulltext(source))
+        assert text == ""
 
     def test_web_record_falls_back_to_scrape(self, monkeypatch):
         import tools.search_sources as ts
@@ -1600,8 +1639,9 @@ class TestEvidenceWebDispatch:
 
         source = {"url": "https://senseaboutscience.org/report.pdf",
                   "source_name": "zai_web", "extra": {"web": True}}
-        text = asyncio.run(fetch_source_fulltext(source))
+        text, attempts = asyncio.run(fetch_source_fulltext(source))
         assert text.startswith("Scraped fallback")
+        assert attempts[-1]["strategy"] == "scrape"
 
 
 class TestWebBibliographyAndDedup:
@@ -1688,7 +1728,8 @@ class TestEvidenceWebReservation:
 
         async def fake_fulltext(source):
             fetched.append(source["url"])
-            return "Full text body. " * 100
+            return "Full text body. " * 100, [{"strategy": "scrape", "ok": True,
+                                               "chars": 1600, "detail": "test"}]
 
         monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
         sources = self._mk_sources()
@@ -1714,7 +1755,7 @@ class TestEvidenceWebReservation:
 
         async def fake_fulltext(source):
             fetched.append(source["url"])
-            return "Full text body. " * 100
+            return "Full text body. " * 100, []
 
         monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
         asyncio.run(ef.build_evidence_corpus(self._mk_sources(), top_n=6, web_slots=0))
@@ -1727,7 +1768,7 @@ class TestEvidenceWebReservation:
 
         async def fake_fulltext(source):
             fetched.append(source["url"])
-            return "Full text body. " * 100
+            return "Full text body. " * 100, []
 
         monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
         sources = [{"title": "Web top", "url": "https://www.transparimed.org/x",
@@ -2668,3 +2709,317 @@ class TestTopicalMetricsRenderer:
         assert "Topical adjudication" in md
         assert "relevant" in md
         assert "Embedding topical filter: rejected 1" in md
+
+
+# ═══════════════════════════════════════════════════════════════════
+# run10-verdict fixes: multi-strategy full-text fetch + strict depth
+# accounting + body-level provisional notice
+# ═══════════════════════════════════════════════════════════════════
+
+
+class TestFulltextIdentityExtraction:
+    """run10 postmortem: DOIs lived inside URLs and the old code only read
+    source['doi'] — the entire academic fetch fleet was dead on arrival."""
+
+    def test_doi_from_url_embedded(self):
+        from agent.evidence_fetcher import _extract_doi
+        s = {"url": "https://doi.org/10.1136/bmj.315.7109.629"}
+        assert _extract_doi(s) == "10.1136/bmj.315.7109.629"
+
+    def test_doi_from_field_and_extra(self):
+        from agent.evidence_fetcher import _extract_doi
+        assert _extract_doi({"doi": "10.1000/xyz"}) == "10.1000/xyz"
+        assert _extract_doi({"extra": {"doi": "https://doi.org/10.1000/abc"}}) == "10.1000/abc"
+
+    def test_doi_trailing_punctuation_stripped(self):
+        from agent.evidence_fetcher import _extract_doi
+        s = {"url": "https://doi.org/10.1000/abc.123."}
+        assert _extract_doi(s) == "10.1000/abc.123"
+
+    def test_no_doi(self):
+        from agent.evidence_fetcher import _extract_doi
+        assert _extract_doi({"url": "https://example.org/paper"}) is None
+
+    def test_nct_id_from_url_and_title(self):
+        from agent.evidence_fetcher import _extract_nct_id
+        assert _extract_nct_id({"url": "https://clinicaltrials.gov/study/NCT02778737"}) == "NCT02778737"
+        assert _extract_nct_id({"title": "Trial NCT01234567 interim"}) == "NCT01234567"
+        assert _extract_nct_id({"url": "https://example.org"}) is None
+
+    def test_arxiv_id_extraction(self):
+        from agent.evidence_fetcher import _extract_arxiv_id
+        assert _extract_arxiv_id({"url": "https://arxiv.org/abs/2411.10971v2"}) == "2411.10971"
+        assert _extract_arxiv_id({"url": "https://arxiv.org/pdf/2101.00001"}) == "2101.00001"
+        assert _extract_arxiv_id({"url": "https://example.org/x"}) is None
+
+
+class TestPmcXmlToText:
+    """eutils efetch XML → readable text; refs/tables/figures dropped."""
+
+    NS = "http://www.ncbi.nlm.nih.gov/JATS1"
+
+    def _xml(self) -> bytes:
+        return f"""
+<article xmlns="{self.NS}">
+  <front><article-meta><title-group>
+    <article-title>Bias in meta-analysis detected by a simple graphical test</article-title>
+  </title-group></article-meta></front>
+  <body>
+    <abstract><p>Funnel plots may be useful to detect bias.</p></abstract>
+    <sec><title>Methods</title>
+      <p>We simulate <xref ref-type="bibr" rid="r1">3</xref> scenarios
+         with <inline-formula>math</inline-formula> notation.</p>
+      <sec><title>Subsection</title><p>Nested body text.</p></sec>
+    </sec>
+    <back><ref-list><ref><p>Reference junk that must be dropped</p></ref></ref-list></back>
+  </body>
+</article>
+""".encode()
+
+    def test_extracts_sections_and_drops_refs(self):
+        from agent.evidence_fetcher import _pmc_xml_to_text
+        text = _pmc_xml_to_text(self._xml())
+        assert "Bias in meta-analysis" in text
+        assert "Funnel plots may be useful" in text
+        assert "METHODS" in text
+        assert "SUBSECTION" in text
+        assert "Nested body text" in text
+        assert "Reference junk" not in text
+        assert "math" not in text  # inline-formula dropped
+
+    def test_malformed_xml_returns_empty(self):
+        from agent.evidence_fetcher import _pmc_xml_to_text
+        assert _pmc_xml_to_text(b"<article><body><p>unclosed") == ""
+
+
+class TestOpenAlexAbstractReconstruction:
+    def test_inverted_index_ordered(self):
+        from agent.evidence_fetcher import _openalex_abstract
+        inv = {"Funnel": [0], "plots": [1], "detect": [3], "may": [2]}
+        assert _openalex_abstract({"abstract_inverted_index": inv}) == "Funnel plots may detect"
+
+    def test_missing_index(self):
+        from agent.evidence_fetcher import _openalex_abstract
+        assert _openalex_abstract({}) == ""
+
+
+class TestCtgovText:
+    def test_json_to_text_flattens(self):
+        from agent.evidence_fetcher import _json_to_text
+        text = _json_to_text({"briefSummary": "A phase III trial", "outcomes": ["primary", "secondary"]})
+        assert "Brief Summary: A phase III trial" in text
+        assert "- primary" in text
+
+    def test_ctgov_fetch_success(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        class FakeResp:
+            status_code = 200
+            def json(self):
+                return {"protocolSection": {"identificationModule": {
+                    "nctId": "NCT02778737",
+                    "briefSummary": "Words. " * 120}}}
+
+        class FakeClient:
+            async def get(self, url, params=None):
+                assert "NCT02778737" in url
+                return FakeResp()
+
+        text, diag = asyncio.run(ef._fetch_ctgov_text(
+            {"url": "https://clinicaltrials.gov/study/NCT02778737"}, FakeClient()))
+        assert diag["ok"] and diag["strategy"] == "ctgov_api"
+        assert len(text) > 500
+
+    def test_ctgov_fetch_no_nct(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+        text, diag = asyncio.run(ef._fetch_ctgov_text({"url": "https://example.org"}, None))
+        assert text == "" and not diag["ok"]
+
+
+class TestStrictFulltextAccounting:
+    """run10 verdict: abstract-level metadata must never count toward the
+    evidence-depth floor — that is metric inflation by another name."""
+
+    def test_evidence_stats_splits_strict_from_abstract(self):
+        import agent.evidence_fetcher as ef
+        corpus = ef.EvidenceCorpus()
+        corpus.fetch_routes = {
+            "https://a": "pmc_efetch",
+            "https://b": "openalex_abstract",
+            "https://c": "ctgov_api",
+            "https://d": "scrape",
+        }
+        corpus.fetched_sources = ["https://a", "https://b", "https://c", "https://d"]
+        st = ef.evidence_stats(corpus)
+        assert st["fulltext_sources_strict"] == 3
+        assert set(st["fulltext_routes"]) == {"https://a", "https://c", "https://d"}
+        assert st["abstract_only_routes"] == {"https://b": "openalex_abstract"}
+
+    def test_corpus_routes_recorded(self, monkeypatch):
+        import agent.evidence_fetcher as ef
+
+        async def fake_fulltext(source):
+            if "pmc" in source["url"]:
+                return "Real full text. " * 100, [{"strategy": "pmc_efetch", "ok": True,
+                                                   "chars": 1600, "detail": "PMC1"}]
+            if "abs" in source["url"]:
+                return "Abstract only. " * 60, [{"strategy": "openalex_abstract", "ok": True,
+                                                 "chars": 720, "detail": "abstract"}]
+            return "", [{"strategy": "scrape", "ok": False, "chars": 0, "detail": "403"}]
+
+        monkeypatch.setattr(ef, "fetch_source_fulltext", fake_fulltext)
+        sources = [
+            {"title": "A", "url": "https://x.org/pmc", "tier": "P1", "score": 0.9},
+            {"title": "B", "url": "https://y.org/abs", "tier": "P1", "score": 0.8},
+            {"title": "C", "url": "https://z.org/dead", "tier": "P2", "score": 0.7},
+        ]
+        st = ef.evidence_stats(asyncio.run(ef.build_evidence_corpus(sources)))
+        assert st["fulltext_sources_strict"] == 1
+        assert st["abstract_only_routes"] == {"https://y.org/abs": "openalex_abstract"}
+        # failed source carries the diagnostic WHY
+        assert st["failed_detail"][0]["strategies_tried"] == ["scrape"]
+        assert "403" in st["failed_detail"][0]["last_detail"]
+
+
+class TestProvisionalNotice:
+    """run10 verdict: 'if it can't fetch, the report should say claims rest
+    on abstracts; treat as provisional IN THE BODY' — rendered by Python,
+    not by an LLM that could soften it."""
+
+    EV = {
+        "fetch_routes": {"https://a": "pmc_efetch", "https://b": "openalex_abstract"},
+        "fulltext_routes": {"https://a": "pmc_efetch"},
+        "abstract_only_routes": {"https://b": "openalex_abstract"},
+        "fetched_detail": [{"url": "https://a", "route": "pmc_efetch"},
+                           {"url": "https://b", "route": "openalex_abstract"}],
+        "failed_detail": [{"url": "https://c", "strategies_tried": ["scrape"],
+                           "last_detail": "HTTP 403"}],
+    }
+
+    def test_notice_rendered_below_floor(self):
+        from agent.evidence_fetcher import build_provisional_notice
+        notice = build_provisional_notice(1, 3, n_sources=10, ev_stats=self.EV)
+        assert notice is not None
+        assert "PROVISIONAL" in notice
+        assert "1 of 10" in notice
+        assert "abstract-level metadata only" in notice  # abstracts excluded from floor
+        assert "pmc_efetch" in notice
+
+    def test_no_notice_at_floor(self):
+        from agent.evidence_fetcher import build_provisional_notice
+        assert build_provisional_notice(3, 3, n_sources=10) is None
+        assert build_provisional_notice(5, 3, n_sources=10) is None
+
+    def test_notice_inserted_after_executive_summary(self):
+        from agent.evidence_fetcher import insert_body_notice
+        report = (
+            "# Title\n\n## EXECUTIVE SUMMARY\n\nBody text.\n\n"
+            "## SCOPE & EVIDENCE BASE\n\nScope.\n\n## SOURCES\n\n[S1] x"
+        )
+        out = insert_body_notice(report, "## NOTICE\n\nWORD.")
+        exec_idx = out.find("## EXECUTIVE SUMMARY")
+        notice_idx = out.find("## NOTICE")
+        scope_idx = out.find("## SCOPE")
+        assert exec_idx < notice_idx < scope_idx
+        assert out.find("## SOURCES") > scope_idx
+
+    def test_notice_inserted_after_h1_when_no_summary(self):
+        from agent.evidence_fetcher import insert_body_notice
+        report = "# Title\n\nSome intro.\n\n## SOURCES\n\n[S1] x"
+        out = insert_body_notice(report, "## NOTICE\n\nWORD.")
+        assert out.index("## NOTICE") < out.index("## SOURCES")
+        assert out.index("# Title") < out.index("## NOTICE")
+
+    def test_notice_never_lands_in_appendix(self):
+        from agent.evidence_fetcher import insert_body_notice
+        report = (
+            "## EXECUTIVE SUMMARY\n\nA.\n\n## SCOPE\n\nB.\n\n"
+            "## METHODOLOGY & PROVENANCE\n\ntable\n\n## SOURCES\n\nx"
+        )
+        out = insert_body_notice(report, "## NOTICE\n\nWORD.")
+        assert out.index("## NOTICE") < out.index("## METHODOLOGY & PROVENANCE")
+
+
+class TestAttestedAnchors:
+    """run11: operator-attested seed URLs are PRISMA hand-search analogues —
+    scored and audited like every other source, but the automated topical
+    gates cannot reject them, and the bypass is disclosed in the audit."""
+
+    ATTESTED = [{
+        "url": "https://www.transparimed.org/single-post/nordic-trials",
+        "title": "Nordic countries: 475 clinical trials with missing results",
+        "snippet": "475 trials never reported.",
+        "tier": "P2",
+        "extra": {"attested": True},
+    }]
+
+    def test_attested_below_floor_is_kept_with_disclosure(self):
+        from agent.topical_filter import apply_topical_filter
+        scr = {}
+        embed_fn = _topic_embed_double([("Nordic countries", 0.50, 0.30)])
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", self.ATTESTED,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_adj_relevant_unless_junk,
+        ))
+        assert len(kept) == 1
+        ex = kept[0]["extra"]
+        assert ex["topical_ok"] is True
+        assert ex["topical_attested"] is True
+        assert "attested" in ex["topical_justification"]
+        assert "bypassed" in ex["topical_justification"]
+        att = scr.get("topical_attested") or []
+        assert len(att) == 1
+        assert att[0]["score"] == 0.5
+        assert "bypassed" in att[0]["justification"]
+
+    def test_attested_cannot_be_llm_removed_via_band(self):
+        """The adjudication band must not be able to override an attestation
+        (retention is by operator attestation, not the vector verdict)."""
+        from agent.topical_filter import apply_topical_filter
+
+        async def adj_always_no(query, phen, dist, src):
+            return False
+
+        scr = {}
+        embed_fn = _topic_embed_double([("Nordic countries", 0.50, 0.30)])
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", self.ATTESTED,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=adj_always_no,
+        ))
+        assert len(kept) == 1
+        assert kept[0]["extra"]["topical_attested"] is True
+        assert kept[0]["extra"]["topical_ok"] is True
+
+    def test_unattested_source_at_same_score_still_rejected(self):
+        """Control: without attestation, the identical sub-floor source is
+        rejected by the vector gate (attestation is the ONLY bypass)."""
+        from agent.topical_filter import apply_topical_filter
+        srcs = [
+            {"url": "https://example.org/nordic-unattested",
+             "title": "Nordic countries: 475 clinical trials with missing results",
+             "snippet": "475 trials never reported.",
+             "tier": "P2", "extra": {}},
+            {"url": "https://example.org/egger",
+             "title": "Bias in meta-analysis detected by a simple graphical test",
+             "snippet": "Funnel plot methods for unreported trials.",
+             "tier": "P1", "extra": {}},
+        ]
+        scr = {}
+        embed_fn = _topic_embed_double([
+            ("Nordic countries", 0.50, 0.30),
+            ("Bias in meta-analysis", 0.80, 0.25),
+        ])
+        kept = asyncio.run(apply_topical_filter(
+            "unpublished negative-result trials never reported", srcs,
+            screening=scr, embed_fn=embed_fn, anchors=ANCHORS_STUB,
+            adjudicate_fn=_adj_relevant_unless_junk,
+        ))
+        titles = {s["title"] for s in kept}
+        assert any("Egger" in t or "Bias in meta-analysis" in t for t in titles)
+        # pool non-empty → starvation valve silent → sub-floor stays rejected
+        assert not any("475" in t for t in titles)
+        rej = scr.get("topical_rejected") or []
+        assert any("475" in r["title"] for r in rej)
+        assert not scr.get("topical_attested")

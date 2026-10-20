@@ -266,6 +266,18 @@ def dedup_sources_canonical(sources: List[Dict]) -> List[Dict]:
             existing["citation_count"] = max(old_cc, dup["citation_count"])
         if len(dup.get("authors", []) or []) > len(existing.get("authors", []) or []):
             existing["authors"] = dup["authors"]
+        # Identity + attestation flags survive merges (run11 finding): the
+        # duplicate is the SAME WORK by DOI identity — a merged record must
+        # not lose canonical_id/backfilled/topical annotations, or the
+        # provenance understates the pool's canonical coverage.
+        for key in ("canonical_id", "backfilled", "why"):
+            if dup.get(key) and not existing.get(key):
+                existing[key] = dup[key]
+        if isinstance(dup.get("extra"), dict):
+            ex = existing.setdefault("extra", {})
+            for k, v in dup["extra"].items():
+                if k not in ex and v is not None:
+                    ex[k] = v
         # Tier: keep the higher tier (P1 > P2 > P3 > UNV)
         tier_rank = {"P1": 4, "P2": 3, "P3": 2, "UNV": 1}
         if tier_rank.get(dup.get("tier", "UNV"), 1) > tier_rank.get(existing.get("tier", "UNV"), 1):
@@ -1283,6 +1295,10 @@ async def _web_sources_for_report(
     flat: List[Any] = []
     ok_queries = 0
     seen: set = set()
+    try:
+        from tools.search_sources import canonicalize_web_url as _canon_url
+    except Exception:
+        _canon_url = None
     for lst in lists:
         if isinstance(lst, Exception):
             logger.debug(f"Web search query failed: {lst}")
@@ -1291,49 +1307,62 @@ async def _web_sources_for_report(
             continue
         ok_queries += 1
         for r in lst:
-            if getattr(r, "url", "") in seen:
+            # Canonical-identity dedup: run11 finding — the seed union
+            # canonicalizes (utm stripped) so a live hit carrying tracking
+            # params must dedup against it or the same page enters twice.
+            raw = getattr(r, "url", "") or ""
+            cu = (_canon_url(raw) if _canon_url else "") or raw
+            if cu in seen:
                 continue
-            seen.add(r.url)
+            seen.add(cu)
             flat.append(r)
 
     stats["results"] = len(flat)
     stats["available"] = ok_queries > 0
 
-    # ── SEED FALLBACK (provider redundancy, honest labeling) ──
-    # When live web search yields nothing (bridge down, upstream 429, egress
-    # blocked), operator-attested VERIFIED grey-literature URLs from
-    # APEX_WEB_SEED_URLS (JSON list of {url,title,snippet,published_date})
-    # enter the SAME governance stack — canonicalization, domain-tier
-    # enforcement, DROP filtering, junk + relevance gates — and are marked
-    # seeded=True in both stats and the record's extra block, so the
-    # provenance appendix can state that live search was unavailable and
-    # seeds were used. A dead search engine never fabricates results; it
-    # only substitutes attested URLs for discovered ones.
+    # ── ATTESTED SEED UNION (provider redundancy + known-good anchors) ──
+    # run11 finding: the old contract fired seeds ONLY when live search
+    # returned nothing. When live search WORKS, the operator-attested
+    # anchors never enter the pool — and topic-critical empirics (the
+    # Nordic 475/83,903 page) vanish from the report because search ranking
+    # is stochastic. Seeds are now a standing union with live discovery:
+    # they flow through the SAME governance stack (canonicalization,
+    # domain-tier enforcement, DROP filtering, junk + relevance gates) and
+    # are labeled seeded=True, while search_mode reports the mix honestly.
+    seeds = _load_web_seed_urls()
+    seed_added = 0
+    for seed in seeds:
+        try:
+            from tools.search_sources import canonicalize_web_url, _web_result_tier
+            url = canonicalize_web_url(str(seed.get("url") or ""))
+            if not url or url in seen:
+                continue
+            tier = _web_result_tier(url)
+            if tier == "DROP":
+                continue
+            seen.add(url)
+            flat.append(SimpleNamespace(
+                url=url,
+                title=re.sub(r"\s+", " ", str(seed.get("title") or url)).strip()[:300],
+                snippet=str(seed.get("snippet") or "")[:600],
+                source_name="web_seed",
+                source_tier=tier,
+                published_date=seed.get("published_date") or "",
+                # attested=True → hand-searched anchor (PRISMA analogue):
+                # scored + audited by the topical filter but never rejected
+                # by it; the screening audit discloses the bypass verbatim.
+                extra={"web": True, "seeded": True, "attested": True},
+            ))
+            seed_added += 1
+        except Exception as e:
+            logger.debug(f"Seed URL {seed.get('url', '?')!r} rejected: {e}")
+    stats["seeded"] = seed_added
     if not flat:
-        seeds = _load_web_seed_urls()
-        for seed in seeds:
-            try:
-                from tools.search_sources import canonicalize_web_url, _web_result_tier
-                url = canonicalize_web_url(str(seed.get("url") or ""))
-                if not url or url in seen:
-                    continue
-                tier = _web_result_tier(url)
-                if tier == "DROP":
-                    continue
-                seen.add(url)
-                flat.append(SimpleNamespace(
-                    url=url,
-                    title=re.sub(r"\s+", " ", str(seed.get("title") or url)).strip()[:300],
-                    snippet=str(seed.get("snippet") or "")[:600],
-                    source_name="web_seed",
-                    source_tier=tier,
-                    published_date=seed.get("published_date") or "",
-                    extra={"web": True, "seeded": True},
-                ))
-            except Exception as e:
-                logger.debug(f"Seed URL {seed.get('url', '?')!r} rejected: {e}")
-        stats["seeded"] = len(flat)
-        stats["search_mode"] = "seeded_fallback" if flat else "unavailable"
+        stats["search_mode"] = "unavailable"
+    elif seed_added and ok_queries > 0:
+        stats["search_mode"] = "live+attested_seeds"
+    elif seed_added:
+        stats["search_mode"] = "seeded_fallback"
     else:
         stats["search_mode"] = "live"
 
@@ -2201,9 +2230,11 @@ def _render_provenance_section(provenance: Dict) -> str:
     if provenance.get("web_records_kept"):
         lines.append(f"| Grey-literature web records in final pool | {provenance.get('web_records_kept')} |")
     if provenance.get("web_seeded"):
-        lines.append(
-            f"| Web records from seeded fallback (live search unavailable) | {provenance.get('web_seeded')} |"
-        )
+        mode = provenance.get("web_search_mode") or ""
+        label = ("Operator-attested seed records (union with live discovery)"
+                 if "live" in mode else
+                 "Web records from seeded fallback (live search unavailable)")
+        lines.append(f"| {label} | {provenance.get('web_seeded')} |")
     if provenance.get("web_search_mode") and provenance.get("web_search_mode") != "off":
         lines.append(f"| Web retrieval mode | {provenance.get('web_search_mode')} |")
     topical = provenance.get("topical") or {}
@@ -2245,6 +2276,11 @@ def _render_provenance_section(provenance: Dict) -> str:
             lines.append(
                 f"| ⚠ Cited sources below the embedding topical floor (starvation-rescued; topical fit unverified) | [S{'], [S'.join(str(x) for x in border_cited)}] |"
             )
+        att_cited = provenance.get("attested_cited") or []
+        if att_cited:
+            lines.append(
+                f"| ⚠ Cited operator-attested anchors (excluded from embedding precision; retention disclosed in screening audit) | [S{'], [S'.join(str(x) for x in att_cited)}] |"
+            )
     else:
         lines.append(
             "| Relevance precision (topical) | not measurable — embedding topical filter unavailable this run; lexical padding screen only |  |"
@@ -2264,6 +2300,24 @@ def _render_provenance_section(provenance: Dict) -> str:
     lines += ["", "Queries executed:"]
     for q in provenance.get("queries", []):
         lines.append(f"- {q}")
+
+    # Fetch-route audit (run10 postmortem): not just HOW MANY sources have
+    # full text but WHICH route produced it and WHY failures failed — the
+    # difference between "0 fetched" as a mystery and "0 fetched" as a
+    # measured, explainable outcome.
+    fetched_detail = ev.get("fetched_detail") or []
+    if fetched_detail:
+        lines += ["", "Full-text fetch routes (measured per source):"]
+        for d in fetched_detail[:14]:
+            lines.append(f"- fetched via `{d.get('route', 'unknown')}`: {d.get('url', '')[:110]}")
+    failed_detail = ev.get("failed_detail") or []
+    if failed_detail:
+        lines += ["", "Full-text fetch failures (routes attempted, last error):"]
+        for d in failed_detail[:14]:
+            lines.append(
+                f"- {d.get('url', '')[:90]} — tried [{', '.join(d.get('strategies_tried') or [])}]; "
+                f"last: {str(d.get('last_detail') or '')[:90]}"
+            )
 
     # Screening decisions — WHICH records were excluded and WHY (the
     # "counter table can't tell you what was screened out" gap).
@@ -2304,6 +2358,22 @@ def _render_provenance_section(provenance: Dict) -> str:
             )
             lines.append(
                 f"- Topical adjudication (LLM judgment on vector-borderline sources): {shown}"
+            )
+        if topical.get("band_overflow"):
+            lines.append(
+                f"- ⚠ Adjudication band overflow: {topical.get('band_overflow')} borderline source(s) "
+                f"beyond the LLM-call cap were decided by the vector score alone"
+            )
+        top_att = topical.get("attested") or []
+        if top_att:
+            shown = "; ".join(
+                f"“{(a.get('title') or '')[:60]}” ({a.get('score')} — attested, "
+                f"automated screening bypassed)"
+                for a in top_att[:6]
+            )
+            lines.append(
+                f"- Attested anchors retained ({len(top_att)}; operator seeds / canonical "
+                f"registry, retention disclosed): {shown}"
             )
         if top_rej:
             shown = "; ".join(
@@ -2580,7 +2650,10 @@ async def generate_research_report(
     # ── Step 6: FULL-TEXT EVIDENCE CORPUS (the quality lever) ──
     try:
         from agent.evidence_fetcher import build_evidence_corpus, evidence_stats
-        corpus = await build_evidence_corpus(all_sources, top_n=6 if depth == "quick" else 8)
+        # run10 postmortem: capping at top-8 left 2 of 10 accepted sources
+        # silently unfetched. The accepted pool is small (topical-filtered);
+        # EVERY final source is now attempted (bounded by EVIDENCE_MAX_FETCH).
+        corpus = await build_evidence_corpus(all_sources)
         ev_stats = None
     except Exception as e:
         logger.warning(f"Evidence corpus build failed (non-fatal): {e}")
@@ -2590,10 +2663,13 @@ async def generate_research_report(
 
     # Full-text depth for the evidence floor (run9 verdict fix 2): the count
     # is factual at build time; only semantic_scoring is corrected post-draft.
+    # STRICT subset: abstract-level metadata (openalex) never counts — the
+    # floor means sources whose text the system actually read.
     fulltext_count_pre = 0
     try:
         from agent.evidence_fetcher import evidence_stats as _evstats
-        fulltext_count_pre = int((_evstats(corpus) or {}).get("fetched_sources", 0) or 0)
+        fulltext_count_pre = int(
+            (_evstats(corpus) or {}).get("fulltext_sources_strict", 0) or 0)
     except Exception:
         pass
 
@@ -2653,6 +2729,33 @@ async def generate_research_report(
         from agent.canonical_sources import late_backfill_for_draft
         canonical_issues, late_added = await late_backfill_for_draft(raw_report, all_sources)
         backfilled_ids.extend(a["entry_id"] for a in late_added)
+        # run11 finding: late backfills entered AFTER corpus build, so their
+        # full text was never attempted. A cited source gets its fetch
+        # attempt whenever it entered — append to the live corpus now.
+        if late_added:
+            from agent.evidence_fetcher import (
+                append_fetched_source,
+                evidence_stats as _evstats_re,
+                EVIDENCE_FETCH_TIMEOUT as _EV_TIMEOUT,
+            )
+            _final_urls_now = {s.get("url") for s in all_sources}
+            for a in late_added:
+                # added["index"] is 1-based (position in the source pool)
+                _idx1 = a.get("index")
+                _idx = _idx1 - 1 if isinstance(_idx1, int) and _idx1 >= 1 else None
+                if _idx is None or not (0 <= _idx < len(all_sources)):
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        append_fetched_source(corpus, all_sources[_idx], _idx),
+                        timeout=_EV_TIMEOUT + 90,
+                    )
+                except Exception as e:
+                    logger.debug(f"Late full-text fetch failed for {a.get('entry_id')}: {e}")
+            fulltext_count_pre = len(
+                set((_evstats_re(corpus) or {}).get("fulltext_routes") or {})
+                & _final_urls_now
+            )
     except Exception as e:
         logger.warning(f"Late canonical backfill failed (non-fatal): {e}")
 
@@ -2736,15 +2839,27 @@ async def generate_research_report(
         topical_mode = (screening or {}).get("topical_mode")
         critique["topical_mode"] = topical_mode
         if topical_mode == "embedding":
-            sub_floor_cited = [
+            # Attested anchors are retained by operator attestation, not by
+            # the embedding filter — they are disclosed separately and
+            # excluded from the precision denominator (precision describes
+            # the FILTER's performance; attestation is a different,
+            # logged inclusion route).
+            attested_cited = [
                 i for i in cited_final
+                if 0 < i <= len(all_sources)
+                and ((all_sources[i - 1].get("extra") or {}).get("topical_attested") is True)
+            ]
+            critique["attested_cited"] = sorted(attested_cited)
+            verifiable = [i for i in cited_final if i not in set(attested_cited)]
+            sub_floor_cited = [
+                i for i in verifiable
                 if 0 < i <= len(all_sources)
                 and ((all_sources[i - 1].get("extra") or {}).get("topical_ok") is False)
             ]
             critique["borderline_cited"] = sorted(sub_floor_cited)
             critique["relevance_precision"] = (
-                round(1.0 - len(sub_floor_cited) / len(cited_final), 3)
-                if cited_final else None
+                round(1.0 - len(sub_floor_cited) / len(verifiable), 3)
+                if verifiable else None
             )
             critique["relevance_precision_mode"] = "embedding_topical"
         else:
@@ -2754,9 +2869,10 @@ async def generate_research_report(
 
         # Post-revision evidence-depth check: did the 'established' language
         # survive the revision pass on a sub-floor full-text base?
+        # STRICT count — abstract-level metadata never supports 'established'.
         try:
             from agent.citation_integrity import scan_unfounded_established as _sue
-            _ft = (ev_stats or {}).get("fetched_sources", 0) if ev_stats else 0
+            _ft = (ev_stats or {}).get("fulltext_sources_strict", 0) if ev_stats else 0
             critique["established_flags_final"] = len(_sue(raw_report, _ft))
         except Exception:
             critique["established_flags_final"] = None
@@ -2765,6 +2881,39 @@ async def generate_research_report(
         critique["padding_flags_final"] = None
         critique["relevance_precision"] = None
         critique["relevance_precision_mode"] = "unavailable"
+
+    # ── Canonical identity tagging (run11 finding) ──
+    # The canonical audit counted only BACKFILLED sources: live-discovered
+    # copies of registry papers (Egger 1997 arriving via web search) went
+    # uncounted and the "canonical_intact" gate failed even though the pool
+    # held the right papers. Tag registry matches BY IDENTITY (DOI), so the
+    # provenance records what the pool contains regardless of entry route.
+    try:
+        from agent.canonical_sources import REGISTRY as _CANON_REG
+        from agent.evidence_fetcher import _extract_doi as _src_doi
+        _reg_by_doi = {e.doi.lower(): e.entry_id for e in _CANON_REG}
+        for _s in all_sources:
+            _doi = (_src_doi(_s) or "").lower()
+            if not _doi:
+                continue
+            _eid = _reg_by_doi.get(_doi)
+            if _eid and not _s.get("canonical_id") and not _s.get("backfilled"):
+                (_s.setdefault("extra", {}))["canonical_match"] = _eid
+        # Safety net: any canonical/backfilled source must carry topical
+        # attestation (run11 finding — late backfills bypass the embedding
+        # pipeline entirely; an unannotated citation reads as unscreened).
+        for _s in all_sources:
+            if _s.get("canonical_id") or _s.get("backfilled"):
+                _ex = _s.setdefault("extra", {})
+                if "topical_ok" not in _ex:
+                    _ex["topical_ok"] = True
+                    _ex["topical_attested"] = True
+                    _ex["topical_justification"] = (
+                        "canonical primary source (identity verified by DOI) — "
+                        "automated topical screening exempt"
+                    )
+    except Exception as e:
+        logger.debug(f"Canonical identity tagging failed (non-fatal): {e}")
 
     # ── Step 10.6: PROVENANCE APPENDIX (deterministic audit trail) ──
     # PRISMA-style funnel rendered from pipeline counters — nothing after
@@ -2799,6 +2948,7 @@ async def generate_research_report(
             "relevance_precision": critique.get("relevance_precision"),
             "relevance_precision_mode": critique.get("relevance_precision_mode"),
             "borderline_cited": critique.get("borderline_cited", []),
+            "attested_cited": critique.get("attested_cited", []),
             "padding_cited": critique.get("padding_cited", []),
             "claim_coverage": critique.get("claim_coverage"),
             "topical": {
@@ -2814,10 +2964,20 @@ async def generate_research_report(
                 "rejected": (screening or {}).get("topical_rejected", []),
                 "adjudicated": (screening or {}).get("topical_adjudicated", []),
                 "borderline": (screening or {}).get("topical_borderline", []),
+                "attested": (screening or {}).get("topical_attested", []),
+                "band_overflow": (screening or {}).get("topical_band_overflow"),
             },
             "evidence_depth": {
+                # STRICT count against the FINAL (pruned) pool, full-text
+                # routes only: abstract-level metadata (openalex) never
+                # satisfies the floor — run10 verdict bans counting
+                # "citation attachment" as "evidentiary support".
                 "fulltext_sources": (
-                    (ev_stats or {}).get("fetched_sources", 0) if ev_stats else 0
+                    len(
+                        set((ev_stats or {}).get("fulltext_routes") or {})
+                        & {s.get("url") for s in all_sources}
+                    )
+                    if ev_stats else 0
                 ),
                 "floor": 3,
                 "established_flags_final": critique.get("established_flags_final"),
@@ -2834,6 +2994,28 @@ async def generate_research_report(
                 "no_results_records": (web_stats or {}).get("registry_no_results", 0),
             },
         }
+        # ── run10 verdict, body-level honesty (deterministic): when fewer
+        # than the floor of FINAL sources have full text, the report says so
+        # IN THE BODY — rendered by Python from measured corpus state, not
+        # drafted by a model that could soften or forget it. Inserted before
+        # the provenance appendix so it is impossible to mistake for
+        # boilerplate buried at the bottom.
+        try:
+            from agent.evidence_fetcher import (
+                build_provisional_notice,
+                insert_body_notice,
+            )
+            ed = provenance.get("evidence_depth") or {}
+            notice = build_provisional_notice(
+                ed.get("fulltext_sources", 0), ed.get("floor", 3),
+                n_sources=len(all_sources), ev_stats=ev_stats,
+            )
+            if notice:
+                raw_report = insert_body_notice(raw_report, notice)
+                provenance.setdefault("evidence_depth", {})["body_notice_rendered"] = True
+        except Exception as e:
+            logger.warning(f"Provisional notice insertion failed (non-fatal): {e}")
+
         raw_report = raw_report.rstrip("\n") + _render_provenance_section(provenance)
 
     # ── Step 11: Parse + finalize ──

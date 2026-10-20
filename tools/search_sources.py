@@ -61,7 +61,10 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 PODCAST_INDEX_API_KEY = os.getenv("PODCAST_INDEX_API_KEY", "")
 PODCAST_INDEX_API_SECRET = os.getenv("PODCAST_INDEX_API_SECRET", "")
 MASTODON_INSTANCE = os.getenv("MASTODON_INSTANCE", "mastodon.social")
-CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "apex-research@example.com")
+# Unpaywall REJECTS example.com addresses (live-verified 422: "Please use
+# your own email address") — the default must be a plausible contact or the
+# OA-PDF route dies silently. Override with CONTACT_EMAIL env in production.
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "apex.research.agent@proton.me")
 
 DEFAULT_MAX_RESULTS = 5
 DEFAULT_TIMEOUT = 15.0

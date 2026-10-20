@@ -154,8 +154,18 @@ async def _get_embedding(query: str) -> List[float]:
     """Generate embedding for a query string.
 
     Primary: Cloudflare Workers AI bge-base-en-v1.5 (768 dims, free)
+    Local:   fastembed bge-small (zero quota — EMBEDDING_PROVIDER=local)
     Fallback: OpenAI text-embedding-3-small (1536 dims, paid)
     """
+    if EMBEDDING_PROVIDER == "local":
+        try:
+            from ingest.embedder import embed_texts_local
+            emb = await embed_texts_local([query])
+            if emb and any(v != 0.0 for v in emb[0]):
+                return emb[0]
+        except Exception as e:
+            logger.error(f"Local embedding failed: {e}")
+        return [0.0] * EMBEDDING_DIMENSIONS
     if EMBEDDING_PROVIDER == "cloudflare":
         embedding = await _get_embedding_cloudflare(query)
         if embedding:

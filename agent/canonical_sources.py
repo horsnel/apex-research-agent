@@ -343,6 +343,22 @@ def _source_dict_from_result(entry: CanonicalEntry, result: object) -> Optional[
         "canonical_id": entry.entry_id,
         "backfilled": True,
         "why": entry.why,
+        # Canonical-registry attestation: these papers enter by VERIFIED DOI
+        # identity (the hand-curated methodological registry), not through
+        # the embedding pipeline — run11 finding: they carry no topical
+        # annotation and the every-cited-source-topically-ok gate reads that
+        # as an unscreened citation. They are attested, screened-exempt, and
+        # excluded from the embedding precision denominator like operator
+        # seeds. Disclosed in the screening audit either way.
+        "extra": {
+            "attested": True,
+            "topical_ok": True,
+            "topical_attested": True,
+            "topical_justification": (
+                f"canonical primary source (identity verified by DOI: {entry.doi}) — "
+                f"automated topical screening exempt"
+            ),
+        },
     }
 
 

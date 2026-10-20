@@ -11,7 +11,7 @@ Includes batching, rate limiting, and error handling.
 import asyncio
 import logging
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import httpx
 import asyncpg
@@ -221,12 +221,62 @@ async def embed_texts_openai(
     return all_embeddings
 
 
+_LOCAL_MODEL: Optional[Any] = None
+_LOCAL_MODEL_LOCK: Optional[asyncio.Lock] = None
+
+
+async def embed_texts_local(texts: List[str]) -> List[List[float]]:
+    """
+    Local embeddings via fastembed (ONNX bge-small-en-v1.5, 384-dim).
+
+    Zero-quota, zero-cost, fully offline after the first model download —
+    the run11 finding: the whole pipeline shares ONE Cloudflare neuron
+    allocation (LLMs + embeddings), so a heavy run can strand the topical
+    filter mid-run when the daily 10k neurons run out. The local provider
+    removes the embedding half of that coupling. Same bge family as the CF
+    model (bge-base, 768-dim) — cosine distributions differ slightly; the
+    topical filter's ratio-based floor adapts, but recalibrate thresholds
+    when switching (probe_topical_floor_local.py).
+    """
+    global _LOCAL_MODEL, _LOCAL_MODEL_LOCK
+    if _LOCAL_MODEL_LOCK is None:
+        _LOCAL_MODEL_LOCK = asyncio.Lock()
+    async with _LOCAL_MODEL_LOCK:
+        if _LOCAL_MODEL is None:
+            def _load():
+                os.environ.setdefault("HF_ENDPOINT", os.getenv("HF_ENDPOINT", "https://hf-mirror.com"))
+                # Small-box guard: default intra-op arenas on many-core hosts
+                # balloon past 1.5GB and OOM-kill the whole pipeline (live
+                # run11 failure, exit 137). Two threads keeps RSS ~150MB.
+                from fastembed import TextEmbedding
+                name = os.getenv("LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+                return TextEmbedding(name, threads=int(os.getenv("LOCAL_EMBED_THREADS", "2")))
+            _LOCAL_MODEL = await asyncio.to_thread(_load)
+            logger.info("Local embedding model loaded (fastembed bge-small-en-v1.5)")
+    def _encode():
+        # Batched encode: run11 OOM postmortem — a single .embed() over the
+        # whole evidence corpus (1000+ chunks after EVIDENCE_MAX_FETCH=40)
+        # materializes onnx attention for batch×512-token sequences at once
+        # (~GBs, exit 137 on a 4GB box). 16-text batches cap peak attention
+        # memory while keeping throughput (2-thread bge-small ≈ 50 texts/s).
+        batch = int(os.getenv("LOCAL_EMBED_BATCH", "16"))
+        out: List[List[float]] = []
+        texts_list = list(texts)
+        for i in range(0, len(texts_list), batch):
+            chunk = texts_list[i:i + batch]
+            out.extend(list(map(float, v)) for v in _LOCAL_MODEL.embed(chunk))
+        return out
+
+    return await asyncio.to_thread(_encode)
+
+
 async def embed_texts(texts: List[str]) -> List[List[float]]:
     """
     Generate embeddings using the configured provider.
 
     Primary: Cloudflare Workers AI (free, same token as LLMs)
     Fallback: OpenAI (paid, may be region-restricted)
+    Local:    fastembed bge-small-en-v1.5 (zero quota, offline)
 
     AUTOMATIC-FALLBACK GUARD: when the LLM router is pointed at a generic
     OpenAI-compatible endpoint (OPENAI_BASE_URL on a non-openai.com host —
@@ -237,6 +287,8 @@ async def embed_texts(texts: List[str]) -> List[List[float]]:
     still routes directly to the configured endpoint — that's an explicit
     operator choice.
     """
+    if EMBEDDING_PROVIDER == "local":
+        return await embed_texts_local(texts)
     if EMBEDDING_PROVIDER == "cloudflare":
         result = await embed_texts_cloudflare(texts)
         # If CF fails (all zeros), try OpenAI as fallback — but only against

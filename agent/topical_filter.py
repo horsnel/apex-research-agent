@@ -223,7 +223,7 @@ def _justification(
 _BAND_BELOW = 0.05      # rejected but within this of the floor → adjudicate
 _BAND_ABOVE = 0.02      # kept but within this of the floor → adjudicate
 _BAND_CONTRAST = 0.03   # |p - d| this close → contrast gate is a coin flip
-_ADJUDICATE_MAX = 10    # cap tiny-LLM calls per pass
+_ADJUDICATE_MAX = 14    # cap tiny-LLM calls per pass (overflow counted in scr)
 
 _ADJUDICATE_PROMPT = """A report is being written for this research question:
 {query}
@@ -388,11 +388,36 @@ async def apply_topical_filter(
 
     kept: List[Dict] = []
     rejected: List[Dict] = []
+    attested_kept: List[Dict] = []
     for s, sp, sd in zip(pending, scores_p, scores_d):
         extra = s.setdefault("extra", {})
         extra["topical_score"] = round(sp, 3)
         if sd is not None:
             extra["topical_distractor_score"] = round(sd, 3)
+        # ── Operator-attested anchors (PRISMA hand-search analogue) ──
+        # run11 finding: the topic's canonical source (the Nordic 475/83,903
+        # page) scored 0.643 vs floor 0.687 — the mid-band noise the bipolar
+        # design was built for, but the adjudication cap exhausted first.
+        # Operator-attested seed URLs are hand-searched anchors: they are
+        # SCORED and AUDITED like everything else, but the automated gates
+        # do not reject them — the attestation is the disclosure, rendered
+        # in the screening audit verbatim.
+        if extra.get("attested"):
+            extra["topical_ok"] = True
+            extra["topical_attested"] = True
+            extra["topical_borderline"] = False
+            extra["topical_justification"] = (
+                f"operator-attested anchor (vector score {sp:.2f} vs floor "
+                f"{threshold:.2f}) — automated screening bypassed, retention "
+                f"disclosed by attestation"
+            )
+            attested_kept.append({
+                "title": (s.get("title") or "")[:120],
+                "score": round(sp, 3),
+                "justification": extra["topical_justification"],
+            })
+            kept.append(s)
+            continue
         ok = _passes(sp, sd)
         if ok:
             extra["topical_ok"] = True
@@ -404,6 +429,8 @@ async def apply_topical_filter(
             extra["topical_borderline"] = False
             extra["topical_justification"] = _justification(sp, sd, threshold, False, False)
             rejected.append((s, sp, sd))
+    if attested_kept:
+        scr.setdefault("topical_attested", []).extend(attested_kept)
 
     # ── LLM adjudication of the BORDERLINE BAND ──
     # Live calibration showed single-vector cosine reorders the middle band
@@ -420,11 +447,17 @@ async def apply_topical_filter(
             band.append((s, sp, sd))
     for s in list(kept):
         ex = s.get("extra") or {}
+        # attested anchors: retention is by attestation, NOT by the vector
+        # verdict — the band must not be able to LLM-remove them
+        if ex.get("topical_attested"):
+            continue
         sp_k = float(ex.get("topical_score") or 0.0)
         sd_k = ex.get("topical_distractor_score")
         if sp_k <= threshold + _BAND_ABOVE:
             band.append((s, sp_k, sd_k))
     band.sort(key=lambda t: abs(t[1] - threshold))
+    if len(band) > _ADJUDICATE_MAX:
+        scr["topical_band_overflow"] = len(band) - _ADJUDICATE_MAX
     band = band[:_ADJUDICATE_MAX]
 
     adjudicated: List[Dict] = []

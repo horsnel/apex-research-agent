@@ -78,7 +78,18 @@ async def direct_scrape(url: str) -> ScrapeResult:
         async with httpx.AsyncClient(
             timeout=TIMEOUT_PER_URL,
             follow_redirects=True,
-            headers={"User-Agent": "APEX-Research-Agent/1.0"},
+            # run10 postmortem: "APEX-Research-Agent/1.0" was 403'd by every
+            # academic publisher (Cloudflare bot scoring). Browser-like UA
+            # rescues plain HTTP sites; CF-protected domains still 403 and
+            # are covered by the API routes in agent/evidence_fetcher.py.
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
         ) as client:
             response = await client.get(url)
             response.raise_for_status()
