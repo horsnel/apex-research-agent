@@ -419,3 +419,244 @@ def scan_concept_boundary_mismatch(
                 break  # one flag per sentence is enough for adjudication
 
     return flags
+
+
+# ── Domain-generalization scan ──────────────────────────────────────
+# Live failure: "Neglect of publication bias compromises meta-analyses of
+# educational research" was cited for "under moderate publication bias the
+# false positive rate can approach 100%" — a domain-restricted simulation
+# finding stated as a general law. Zero-overlap alignment can't catch it
+# (the words overlap); the failure is SCOPE, not topic.
+
+_DOMAIN_HEAD = (
+    r"(?:research|studies|trials|patients?|populations?|practice|settings?"
+    r"|children|adolescents|adults?|women|men|nurses?|physicians?|schools?"
+    r"|universities|cohorts?|surveys?|projects?|mice|rats|animals?"
+    r"|registr(?:y|ies))"
+)
+# Trailing "in/of/among <up to 3 words> <head>" qualifier in a source title.
+_DOMAIN_QUALIFIER_RE = re.compile(
+    r"\b(?:in|of|among)\s+((?:[a-z][a-z\-']*\s+){0,3}" + _DOMAIN_HEAD + r")\b[\s.,\"']*$",
+    re.I,
+)
+# Claims strong enough that an unstated scope restriction matters.
+_STRENGTH_MARKERS_RE = re.compile(
+    r"\b\d+(?:\.\d+)?\s?(?:%|percent)\b"
+    r"|\bapproach(?:es|ed)?\b"
+    r"|\bas (?:high|large|many|much) as\b"
+    r"|\bup to\b"
+    r"|\bcan (?:reach|exceed|approach|be as high as)\b"
+    r"|\bnearly\b|\balmost\b"
+    r"|\bmost\b|\bthe majority\b"
+    r"|\bwidespread\b|\bcommonly\b"
+    r"|\btypically\b|\bgenerally\b",
+    re.I,
+)
+
+def scan_domain_generalization(
+    report_text: str,
+    sources: List[Dict],
+    max_flags: int = 3,
+) -> List[Dict]:
+    """Deterministic domain-scope check for cited sentences.
+
+    When a source's title restricts its conclusion to a domain/population
+    (e.g. "...in educational research"), a citing sentence that asserts a
+    strong quantitative/general claim WITHOUT any of the qualifier's tokens
+    is flagged for the critique pass to adjudicate: either restrict the
+    claim to the source's scope or attribute the scope explicitly.
+    """
+    flags: List[Dict] = []
+
+    main_text = report_text
+    bib_match = re.search(r'\n##\s*SOURCES\b.*\Z', report_text, re.DOTALL | re.IGNORECASE)
+    if bib_match:
+        main_text = report_text[:bib_match.start()]
+
+    # Pre-compute per-source domain qualifiers (token sets, len>=4)
+    quals: Dict[int, set] = {}
+    for i, src in enumerate(sources, 1):
+        title = (src.get("title") or "").strip()
+        m = _DOMAIN_QUALIFIER_RE.search(title)
+        if not m:
+            continue
+        toks = {t for t in re.findall(r"[a-z][a-z\-']{3,}", m.group(1).lower())}
+        # Generic method contexts are not domain restrictions
+        if toks and toks <= {"meta", "analyses", "analysis", "systematic",
+                             "review", "reviews", "evidence", "syntheses",
+                             "synthesis", "prospective", "registered"}:
+            continue
+        if toks:
+            quals[i] = toks
+    if not quals:
+        return flags
+
+    lines = [ln for ln in main_text.split("\n") if not ln.strip().startswith(("#", "|"))]
+    sentences = re.split(r"(?<=[.!?])\s+", "\n".join(lines))
+    for sentence in sentences:
+        if len(sentence.split()) < 8 or len(flags) >= max_flags:
+            continue
+        if not _STRENGTH_MARKERS_RE.search(sentence):
+            continue
+        cited = sorted({n for n in extract_numbered_citations(sentence) if 1 <= n <= len(sources)})
+        if not cited:
+            continue
+        sent_l = sentence.lower()
+        for n in cited:
+            toks = quals.get(n)
+            if not toks:
+                continue
+            if any(t in sent_l for t in toks):
+                continue  # scope carried into the claim — fine
+            flags.append({
+                "source": n,
+                "excerpt": sentence.strip()[:160],
+                "reason": (
+                    "the cited source's conclusion is scoped to "
+                    f"'{' '.join(sorted(toks))}' — the claim states it without "
+                    "that scope restriction; restrict the claim or attribute the scope"
+                ),
+            })
+            break
+
+    return flags
+
+
+# ── News-tier citation scan ─────────────────────────────────────────
+# Live failure: Pulmonology Advisor (consumer medical news, web P3) was
+# cited for a claim while peer-reviewed sources in the same pool covered
+# the same point. A premium report cites peer-reviewed literature for
+# scientific claims; news/web sources are for documented real-world events.
+
+_NEWS_HOST_RE = re.compile(
+    r"(?:news|advisor|media|daily|times|post|herald|tribune|chronicle"
+    r"|weekly|today|magazine|forbes|bloomberg|reuters|barron|express"
+    r"|buzzfeed|substack|blogspot|wordpress|medium\.com|outreach|digest)",
+    re.I,
+)
+
+def scan_news_tier_citations(
+    report_text: str,
+    sources: List[Dict],
+    max_flags: int = 2,
+) -> List[Dict]:
+    """Flag news/consumer-tier web sources cited for claims that a
+    peer-reviewed (P1) source in the pool also supports.
+
+    Only fires when a P1 source shares >=2 content words with the news
+    source's title+snippet — i.e. a re-anchoring target actually exists.
+    """
+    flags: List[Dict] = []
+
+    news_idx: Dict[int, set] = {}
+    for i, src in enumerate(sources, 1):
+        if (src.get("tier") or "").upper() != "P3":
+            continue
+        host = ""
+        url = src.get("url") or (src.get("extra") or {}).get("web_url") or ""
+        m = re.search(r"(?:https?://)?(?:www\.)?([^/:?#]+)", url or "")
+        if m:
+            host = m.group(1)
+        if host and _NEWS_HOST_RE.search(host):
+            news_idx[i] = _alignment_content_words(
+                f"{src.get('title') or ''} {src.get('snippet') or ''}"
+            )
+    if not news_idx:
+        return flags
+
+    # Best peer-reviewed re-anchoring target per news source
+    replacement: Dict[int, int] = {}
+    for i, news_words in news_idx.items():
+        best_p, best_shared = 0, 0
+        for j, src in enumerate(sources, 1):
+            if j == i or (src.get("tier") or "").upper() != "P1":
+                continue
+            shared = news_words & _alignment_content_words(
+                f"{src.get('title') or ''} {src.get('snippet') or ''}"
+            )
+            if len(shared) > best_shared:
+                best_p, best_shared = j, len(shared)
+        if best_shared >= 2:
+            replacement[i] = best_p
+    if not replacement:
+        return flags
+
+    main_text = report_text
+    bib_match = re.search(r'\n##\s*SOURCES\b.*\Z', report_text, re.DOTALL | re.IGNORECASE)
+    if bib_match:
+        main_text = report_text[:bib_match.start()]
+    lines = [ln for ln in main_text.split("\n") if not ln.strip().startswith(("#", "|"))]
+    sentences = re.split(r"(?<=[.!?])\s+", "\n".join(lines))
+    for sentence in sentences:
+        if len(sentence.split()) < 8 or len(flags) >= max_flags:
+            continue
+        cited = sorted({n for n in extract_numbered_citations(sentence) if 1 <= n <= len(sources)})
+        for n in cited:
+            if n in replacement and n not in {f["source"] for f in flags}:
+                p = replacement[n]
+                flags.append({
+                    "source": n,
+                    "replacement": p,
+                    "excerpt": sentence.strip()[:160],
+                    "reason": (
+                        f"a news/consumer-tier web source is cited for a scientific "
+                        f"claim while peer-reviewed [S{p}] covers the same point — "
+                        f"re-anchor the claim to [S{p}], or keep [S{n}] only for the "
+                        "documented real-world event it reports (never for the science)"
+                    ),
+                })
+                break
+
+    return flags
+
+
+# ── Scope-dodge scan ────────────────────────────────────────────────
+# Live failure (run7 verdict): the SCOPE section conceded the query's
+# literal demand could not be met but stayed in the safe zone — a generic
+# hedge with no STRUCTURAL reason (why the demanded data fundamentally
+# cannot exist) and no presentation of documented real-world attempts.
+
+_SCOPE_SECTION_RE = re.compile(r"\n##\s*SCOPE\b[^\n]*\n(.*?)(?=\n##\s|\Z)", re.I | re.S)
+_FEASIBILITY_NEGATION_RE = re.compile(
+    r"cannot (?:be |directly |fully |systematically )?(?:perform|conduct|address|analyz|answer|compile|execute)"
+    r"|not (?:methodologically |currently |directly |statistically |empirically )?feasible"
+    r"|could not be (?:directly |fully |systematically )?(?:analyzed|performed|addressed|answered|compiled)"
+    r"|(?:is|are) not (?:directly |currently |methodologically )?(?:possible|available|analyzable|achievable)"
+    r"|unable to (?:perform|conduct|address|analyz|compile)",
+    re.I,
+)
+_STRUCTURAL_REASON_RE = re.compile(
+    r"by definition|no sampling frame|never (?:been )?(?:registered|reported|published|recorded|indexed)"
+    r"|(?:does|do) not exist|no denominator|impossible to (?:enumerate|identify|count|compile|locate)"
+    r"|cannot be enumerated|not systematically (?:recorded|captured|collected|indexed)"
+    r"|no systematic record|no (?:way|method) to (?:enumerate|identify|count|locate|retrieve)"
+    r"|hidden (?:population|fraction)|no (?:such )?(?:database|registry|index|denominator)"
+    r"|no exhaustive|inherently (?:unknowable|unmeasurable|unobservable)",
+    re.I,
+)
+
+def scan_scope_dodge(report_text: str) -> List[Dict]:
+    """Flag a SCOPE section that negates feasibility without the structural
+    argument. Returns at most one flag — the fix is additive content."""
+    flags: List[Dict] = []
+    m = _SCOPE_SECTION_RE.search(report_text or "")
+    if not m:
+        return flags
+    scope_text = m.group(1)
+    if not _FEASIBILITY_NEGATION_RE.search(scope_text):
+        return flags
+    if _STRUCTURAL_REASON_RE.search(scope_text):
+        return flags
+    flags.append({
+        "source": 0,
+        "excerpt": re.sub(r"\s+", " ", scope_text).strip()[:200],
+        "reason": (
+            "the SCOPE section concedes the query's literal demand cannot be "
+            "met but gives only a generic hedge — it must state the STRUCTURAL "
+            "reason (why the demanded data/analysis fundamentally cannot exist, "
+            "not merely that it was not found) and, where the source list "
+            "contains documented real-world attempts/audits of the problem, "
+            "present what they found"
+        ),
+    })
+    return flags

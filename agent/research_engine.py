@@ -1413,6 +1413,7 @@ class ResearchReport:
     expanded_queries: List[str] = field(default_factory=list)
     generation_mode: str = "sectionwise"                  # "sectionwise" | "single_call"
     model_used: str = ""
+    provenance: Dict = field(default_factory=dict)        # PRISMA-style funnel audit trail
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1440,6 +1441,8 @@ CLAIM-SOURCE FIDELITY (NON-NEGOTIABLE):
 - Before attaching [Sn] to a sentence, verify that source actually supports THAT claim — not merely a related topic.
 - If the source addresses a related-but-different problem (e.g. accumulation bias ≠ publication bias; workflow automation ≠ making inaccessible data accessible), NEVER present it as solving the claim's problem. Restate the claim to what the source actually supports, or drop the citation and mark the sentence [UNVERIFIED].
 - Encyclopedias may support background definitions only — never named methods, statistical procedures, or empirical results.
+- SCOPE FIDELITY: if a source's title restricts its conclusion to a domain or population (e.g. "...in educational research", "...in mice"), NEVER state that conclusion unqualified — carry the restriction into the sentence or drop the generalization.
+- News/consumer web sources are not peer-reviewed evidence: cite them only for the documented real-world events they report (investigations, audits, policy actions), never for scientific findings that a peer-reviewed source in the pool also covers.
 - Describe each source's actual scope; do not inflate its contribution to fit your narrative."""
 
 
@@ -1453,8 +1456,11 @@ Given the report and its numbered source list, identify ONLY these defect types:
 5. FRAMING_MISMATCH: the title or section structure promises an analysis the cited evidence cannot deliver (e.g. claims to study X directly when the evidence only supports an indirect estimate related to X) — the fix is a reframing instruction, never invented evidence
 6. CLAIM_SOURCE_MISMATCH: a citation attached to a claim about a DIFFERENT problem than the source addresses — e.g. a source about accumulation bias (type-I error from repeatedly updating a meta-analysis) cited as if it addressed publication bias (unpublished studies); a workflow-automation tool cited as making inaccessible data accessible. The fix MUST restate the claim to what the source actually supports, or drop the claim
 7. ENCYCLOPEDIA_CITATION: a named method, statistical procedure, or empirical result cited to an encyclopedia — fix: keep encyclopedias for background definitions only; attribute methods/results to primary literature or mark [UNVERIFIED]
+8. SCOPE_DODGED: the SCOPE section concedes the query's literal demand cannot be met but offers only a generic hedge — no STRUCTURAL reason (why the demanded data/analysis fundamentally cannot exist, not merely that it was not found) and no presentation of documented real-world attempts/audits that exist in the source list. Fix: state the structural reason and present those attempts with citations
+9. DOMAIN_GENERALIZATION: a source's conclusion is stated without the domain/population scope its title restricts it to (e.g. a finding demonstrated in educational research generalized to all research). Fix: restrict the claim to the source's scope or attribute the scope explicitly
+10. NEWS_TIER_CITATION: a scientific claim cited to a news/consumer web source when a peer-reviewed source in the list supports the same point. Fix: re-anchor the citation to the peer-reviewed source; keep the news source only for the documented event it reports
 
-Pay special attention to MECHANICALLY FLAGGED PAIRS if present — they are deterministic suspects for type 1/6.
+Pay special attention to MECHANICALLY FLAGGED PAIRS if present — they are deterministic suspects for type 1/6/9/10.
 
 Return ONLY valid JSON:
 {"issues": [{"section_heading": "...", "type": "...", "detail": "...", "fix": "specific instruction"}]}
@@ -1468,7 +1474,7 @@ DEFAULT_QUICK_SECTIONS = [
 ]
 
 DEFAULT_THOROUGH_SECTIONS = [
-    {"id": "scope", "title": "SCOPE & EVIDENCE BASE", "purpose": "State what the evidence base actually supports: what was retrievable, what could NOT be analyzed directly, and any framing limits — BEFORE any findings", "key_questions": ["What evidence was actually retrieved?", "What could not be analyzed directly and why?", "Does the evidence support the query's literal demand?"]},
+    {"id": "scope", "title": "SCOPE & EVIDENCE BASE", "purpose": "State what the evidence base actually supports: what was retrievable, what could NOT be analyzed directly, and any framing limits — BEFORE any findings. If the query's literal demand is not satisfiable, state the STRUCTURAL reason why the demanded data/analysis fundamentally cannot exist (not merely that it was not found) and present any documented real-world attempts/audits in the pool that demonstrate the limitation", "key_questions": ["What evidence was actually retrieved?", "What could not be analyzed directly and why — structurally, not just in this search?", "Does the evidence support the query's literal demand?", "What do documented real-world attempts (registries, audits, NGO investigations) in the source list show about that limitation?"]},
     {"id": "exec_summary", "title": "EXECUTIVE SUMMARY", "purpose": "Key findings, overall confidence, critical gaps, why it matters", "key_questions": ["What are the most important established findings?", "What remains uncertain or contested?", "Why does this topic matter now?"]},
     {"id": "key_findings", "title": "KEY FINDINGS", "purpose": "8-15 detailed findings with evidence table and epistemic status", "key_questions": ["What did the strongest P1/P2 sources find?", "Which findings are ESTABLISHED vs TENTATIVE?", "What numbers/effect sizes are reported?"]},
     {"id": "comparative", "title": "COMPARATIVE ANALYSIS", "purpose": "Multi-dimension comparison table of approaches/methods/options with trade-off analysis", "key_questions": ["What are the main approaches/options?", "How do they differ across key dimensions?", "When is each optimal?"]},
@@ -1659,7 +1665,7 @@ Choose 4-{len(DEFAULT_THOROUGH_SECTIONS)} sections. You may adapt the standard s
 
 FRAMING HONESTY (MANDATORY):
 1. report_title: an HONEST title describing what the evidence base actually supports — NOT the query verbatim. If the sources only permit an INDIRECT analysis of the query's literal subject, the title must reflect that (e.g. "What publication-bias research reveals about the scale of the unpublished-trial problem").
-2. The FIRST section MUST be titled "SCOPE & EVIDENCE BASE" and must state: what evidence was actually retrievable, what could NOT be analyzed directly, and whether the query's literal demand is methodologically feasible with this evidence base.
+2. The FIRST section MUST be titled "SCOPE & EVIDENCE BASE" and must state: what evidence was actually retrievable, what could NOT be analyzed directly, and whether the query's literal demand is methodologically feasible with this evidence base. If it is not feasible, the section MUST give the structural reason (why the demanded data/analysis fundamentally cannot exist — not merely that it was not found) and point to the closest documented real-world attempts in the source list.
 3. Never plan a section that implies direct evidence for the query's core subject unless such sources exist above.
 
 Return ONLY valid JSON:
@@ -1834,13 +1840,17 @@ async def _critique_and_revise(
     from agent.llm_router import synthesize_with_router
     from agent.citation_integrity import (
         check_report_citations, scan_claim_source_alignment,
-        scan_concept_boundary_mismatch,
+        scan_concept_boundary_mismatch, scan_domain_generalization,
+        scan_news_tier_citations, scan_scope_dodge,
     )
     from agent.canonical_sources import scan_canonical_method_usage
 
     citation_report = check_report_citations(report_text, sources)
     alignment_flags = scan_claim_source_alignment(report_text, sources)
     boundary_flags = scan_concept_boundary_mismatch(report_text, sources)
+    domain_flags = scan_domain_generalization(report_text, sources)
+    news_flags = scan_news_tier_citations(report_text, sources)
+    scope_flags = scan_scope_dodge(report_text)
     canonical_issues = scan_canonical_method_usage(report_text, sources)
     critique_summary = {
         "citation_precision": citation_report.citation_precision,
@@ -1849,6 +1859,9 @@ async def _critique_and_revise(
         "uncited_claims": len(report_text and citation_report.uncited_claim_sentences or []),
         "alignment_flags": len(alignment_flags),
         "boundary_flags": len(boundary_flags),
+        "domain_flags": len(domain_flags),
+        "news_flags": len(news_flags),
+        "scope_flags": len(scope_flags),
         "canonical_issues": len(canonical_issues),
         "llm_issues": 0,
         "revised": False,
@@ -1866,6 +1879,12 @@ async def _critique_and_revise(
         mechanical_flags = list(alignment_flags) + [
             {"source": f["source"], "excerpt": f["excerpt"], "reason": f.get("reason", "")}
             for f in boundary_flags
+        ] + [
+            {"source": f["source"], "excerpt": f["excerpt"], "reason": f.get("reason", "")}
+            for f in domain_flags
+        ] + [
+            {"source": f["source"], "excerpt": f["excerpt"], "reason": f.get("reason", "")}
+            for f in news_flags
         ]
         if mechanical_flags:
             pairs = "\n".join(
@@ -1907,10 +1926,25 @@ Find the worst hallucinated citations, missing citations, and unsupported superl
     canonical_issue_strs = [
         f"[{i['type']}] {i['detail']} → {i['fix']}" for i in canonical_issues
     ]
+    # Scope-dodge flags carry no source number — format without the [S{n}] head
+    scope_issue_strs = [
+        f"[SCOPE_DODGED] {f['excerpt']} — {f['reason']}" for f in scope_flags
+    ]
+    domain_issue_strs = [
+        f"[DOMAIN_GENERALIZATION] [S{f['source']}] “{f['excerpt']}” — {f['reason']}"
+        for f in domain_flags
+    ]
+    news_issue_strs = [
+        f"[NEWS_TIER_CITATION] [S{f['source']}] “{f['excerpt']}” — {f['reason']}"
+        for f in news_flags
+    ]
     all_issues = (
         list(extra_issues or [])
         + list(citation_report.issues)
         + canonical_issue_strs
+        + scope_issue_strs
+        + domain_issue_strs
+        + news_issue_strs
         + [f"[{i.get('type')}] {i.get('detail')} → {i.get('fix')}" for i in llm_issues]
     )
 
@@ -1972,6 +2006,50 @@ Return the FULL corrected report (same structure and LENGTH, ## sections, [Sn] c
             logger.info(f"Revision attempt {attempt} ({label}) failed: {e}")
 
     return report_text, critique_summary, ""
+
+
+def _render_provenance_section(provenance: Dict) -> str:
+    """Deterministic PRISMA-style audit-trail appendix. No LLM involved —
+    this is the reproducibility record of how the report was built."""
+    ev = provenance.get("evidence", {}) or {}
+    lines = [
+        "",
+        "## METHODOLOGY & PROVENANCE",
+        "",
+        "Reproducible audit trail of the retrieval pipeline that produced this "
+        "report (PRISMA-style flow). Generated deterministically from pipeline "
+        "counters — not drafted by a model.",
+        "",
+        "| Pipeline stage | Count |",
+        "|---|---|",
+        f"| Records identified (live APIs + RAG + web) | {provenance.get('identified_records', 0)} |",
+        f"| After canonical dedup | {provenance.get('post_dedup', 0)} |",
+        f"| After relevance/diversity selection | {provenance.get('post_selection', 0)} |",
+        f"| After snowball + gap-fill enrichment | {provenance.get('post_enrichment', 0)} |",
+        f"| Canonical primary sources backfilled (by verified DOI) | {provenance.get('canonical_backfilled', 0)} |",
+        f"| Final cited pool (after dead-source pruning) | {provenance.get('final_sources', 0)} |",
+    ]
+    tiers = provenance.get("tier_breakdown") or {}
+    if tiers:
+        tier_str = ", ".join(f"{k}: {v}" for k, v in sorted(tiers.items()))
+        lines.append(f"| Final pool by source tier | {tier_str} |")
+    if provenance.get("web_records_kept"):
+        lines.append(f"| Grey-literature web records in final pool | {provenance.get('web_records_kept')} |")
+    lines += [
+        f"| Full-text evidence chunks | {ev.get('chunks', 0)} |",
+        f"| Sources with full text fetched | {ev.get('fetched_sources', 0)} |",
+        f"| Evidence corpus size (chars) | {ev.get('total_chars', 0)} |",
+        f"| Semantic scoring active | {'yes' if ev.get('semantic_scoring') else 'keyword fallback'} |",
+        f"| Citation precision | {provenance.get('citation_precision', 'n/a')} |",
+        f"| Claim coverage | {provenance.get('claim_coverage', 'n/a')} |",
+    ]
+    pruned = provenance.get("pruned_uncited") or []
+    if pruned:
+        lines.append(f"| Uncited sources pruned | {len(pruned)} |")
+    lines += ["", "Queries executed:"]
+    for q in provenance.get("queries", []):
+        lines.append(f"- {q}")
+    return "\n".join(lines) + "\n"
 
 
 async def generate_research_report(
@@ -2058,15 +2136,18 @@ async def generate_research_report(
         successful.append("zai_web")
     elif web_stats.get("enabled"):
         failed.append("zai_web: bridge unavailable")
+    funnel: Dict = {"identified": len(all_sources)}
 
     # ── Step 3: Canonical dedup → diverse selection → domain-aware decay ──
     all_sources = dedup_sources_canonical(all_sources)
+    funnel["post_dedup"] = len(all_sources)
     all_sources = select_diverse_sources(
         all_sources,
         max_sources=28 if depth == "thorough" else 18,
         query=query,
         query_variants=variants,
     )
+    funnel["post_selection"] = len(all_sources)
 
     # ── Step 4: Snowball top academic seeds (thorough mode adds the most) ──
     if depth == "thorough":
@@ -2121,6 +2202,8 @@ async def generate_research_report(
         backfilled_ids = [b["entry_id"] for b in backfilled]
     except Exception as e:
         logger.warning(f"Canonical backfill failed (non-fatal): {e}")
+    funnel["post_enrichment"] = len(all_sources)
+    funnel["canonical_backfilled"] = len(backfilled_ids)
 
     if not all_sources:
         # Absolute fallback: single-call generation on empty evidence
@@ -2241,6 +2324,36 @@ async def generate_research_report(
             f"{prune_stats['before']} → {prune_stats['after']} (renumbered)"
         )
 
+    # ── Step 10.6: PROVENANCE APPENDIX (deterministic audit trail) ──
+    # PRISMA-style funnel rendered from pipeline counters — nothing after
+    # this point rewrites the text, so the appendix stays consistent.
+    provenance: Dict = {}
+    if generation_mode == "sectionwise":
+        tier_counts: Dict[str, int] = {}
+        for s in all_sources:
+            t = (s.get("tier") or "UNV").upper()
+            tier_counts[t] = tier_counts.get(t, 0) + 1
+        provenance = {
+            "identified_records": funnel.get("identified", 0),
+            "post_dedup": funnel.get("post_dedup", 0),
+            "post_selection": funnel.get("post_selection", 0),
+            "post_enrichment": funnel.get("post_enrichment", 0),
+            "canonical_backfilled": funnel.get("canonical_backfilled", 0),
+            "final_sources": len(all_sources),
+            "tier_breakdown": tier_counts,
+            "web_records_kept": sum(
+                1 for s in all_sources if (s.get("extra") or {}).get("web")
+            ),
+            "evidence": ev_stats,
+            "queries": [query] + [
+                v for v in variants if v.strip().lower() != query.strip().lower()
+            ],
+            "pruned_uncited": prune_stats.get("pruned", []),
+            "citation_precision": critique.get("citation_precision"),
+            "claim_coverage": critique.get("claim_coverage"),
+        }
+        raw_report = raw_report.rstrip("\n") + _render_provenance_section(provenance)
+
     # ── Step 11: Parse + finalize ──
     report = _parse_report(raw_report)
     report.query = query
@@ -2252,6 +2365,7 @@ async def generate_research_report(
     report.from_cache = False
     report.evidence = ev_stats
     report.citation_metrics = critique
+    report.provenance = provenance
     report.expanded_queries = variants
     report.generation_mode = generation_mode
     report.model_used = models_used[-1] if models_used else ""

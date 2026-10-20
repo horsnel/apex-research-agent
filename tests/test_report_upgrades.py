@@ -27,12 +27,16 @@ from agent.research_engine import (
     apply_temporal_decay,
     _extract_source_year,
     verify_claims_from_sources,
+    _render_provenance_section,
 )
 from agent.citation_integrity import (
     extract_numbered_citations,
     check_report_citations,
     build_sources_section,
     CitationReport,
+    scan_domain_generalization,
+    scan_news_tier_citations,
+    scan_scope_dodge,
 )
 from agent.verifier import (
     select_nli_candidates,
@@ -1740,3 +1744,170 @@ class TestRelevanceGateCoreQuestion:
         urls = {s["url"] for s in selected}
         assert self.EMPIRICS["url"] in urls
         assert padding["url"] not in urls
+
+
+# ═══════════════════════════════════════════════════════════════
+# RUN7-CRITIQUE DEFENSES: domain generalization, news-tier citations,
+# scope dodging, provenance appendix
+# ═══════════════════════════════════════════════════════════════
+
+class TestDomainGeneralizationScan:
+    EDU = {"title": "Neglect of publication bias compromises meta-analyses of educational research",
+           "snippet": "simulation of moderate publication bias scenarios", "tier": "P1"}
+    EGGER = {"title": "Bias in meta-analysis detected by a simple graphical test",
+             "snippet": "funnel plot asymmetry", "tier": "P1"}
+    BODY = ("## FINDINGS\n\n"
+            "Under moderate publication bias the false positive rate can approach 100% [S1]. "
+            "Asymmetric funnel plots suggest publication bias in observed evidence [S2].\n\n"
+            "## SOURCES\n\n[S1] x. [S2] y.")
+
+    def test_flags_unscoped_generalization(self):
+        flags = scan_domain_generalization(self.BODY, [self.EDU, self.EGGER])
+        assert len(flags) == 1
+        assert flags[0]["source"] == 1
+        assert "educational" in flags[0]["reason"]
+
+    def test_passes_claim_that_carries_the_scope(self):
+        body = ("## FINDINGS\n\nIn educational research the false positive rate "
+                "can approach 100% under moderate bias [S1].\n\n## SOURCES\n\n[S1] x.")
+        assert scan_domain_generalization(body, [self.EDU]) == []
+
+    def test_generic_method_qualifier_never_flags(self):
+        body = ("## FINDINGS\n\nSmall-study effects are most commonly detected by "
+                "test statistics in pooled evidence [S1].\n\n## SOURCES\n\n[S1] x.")
+        assert scan_domain_generalization(body, [self.EGGER]) == []
+
+    def test_weak_claim_without_strength_marker_not_flagged(self):
+        body = ("## FINDINGS\n\nThe authors report the mechanism through which "
+                "omitted studies distort pooled conclusions [S1].\n\n## SOURCES\n\n[S1] x.")
+        assert scan_domain_generalization(body, [self.EDU]) == []
+
+
+class TestNewsTierCitationScan:
+    NEWS = {"title": "Why negative study results go unreported",
+            "snippet": "negative data were often considered unimportant in trials",
+            "tier": "P3", "url": "https://www.pulmonologyadvisor.com/a/article.html"}
+    P1 = {"title": "Impact of unpublished clinical trials on meta-analysis effect estimates",
+          "snippet": "systematic review of publication bias and negative trials",
+          "tier": "P1", "url": "https://doi.org/10.1111/x"}
+    BODY = ("## FINDINGS\n\nNegative data were often considered unimportant in trials [S1]. "
+            "Unpublished trials distort pooled estimates [S2].\n\n## SOURCES\n\n[S1] n. [S2] p.")
+
+    def test_flags_news_cited_with_p1_available(self):
+        flags = scan_news_tier_citations(self.BODY, [self.NEWS, self.P1])
+        assert len(flags) == 1
+        assert flags[0]["source"] == 1 and flags[0]["replacement"] == 2
+
+    def test_silent_without_p1_reanchor_target(self):
+        weak = {"title": "Coral reef bleaching patterns", "snippet": "marine ecology",
+                "tier": "P1", "url": "https://j.example.org/1"}
+        assert scan_news_tier_citations(self.BODY, [self.NEWS, weak]) == []
+
+    def test_p2_transparency_source_never_treated_as_news(self):
+        ngo = {"title": "Nordic unreported trials audit",
+               "snippet": "475 trials without published results",
+               "tier": "P2", "url": "https://ebmnews.example.org/nordic-report"}
+        assert scan_news_tier_citations(
+            "The Nordic audit found 475 trials without results [S1].\n\n## SOURCES\n\n[S1] x.",
+            [ngo, self.P1],
+        ) == []
+
+    def test_uncited_news_source_not_flagged(self):
+        body = "## FINDINGS\n\nUnpublished trials distort pooled estimates [S2].\n\n## SOURCES\n\n[S1] n. [S2] p."
+        assert scan_news_tier_citations(body, [self.NEWS, self.P1]) == []
+
+
+class TestScopeDodgeScan:
+    GENERIC = ("# T\n\n## SCOPE & EVIDENCE BASE\n\nA direct meta-analysis of this question "
+               "cannot be performed with the evidence retrieved here.\n\n## FINDINGS\n\nbody")
+    STRUCTURAL = ("# T\n\n## SCOPE & EVIDENCE BASE\n\nSuch a meta-analysis cannot be performed: "
+                  "trials that were never registered are by definition not systematically "
+                  "recorded, so no sampling frame exists.\n\n## FINDINGS\n\nbody")
+    FEASIBLE = ("# T\n\n## SCOPE & EVIDENCE BASE\n\nThe evidence base supports a direct "
+                "synthesis of the retrieved trials.\n\n## FINDINGS\n\nbody")
+
+    def test_flags_generic_hedge(self):
+        flags = scan_scope_dodge(self.GENERIC)
+        assert len(flags) == 1
+        assert "STRUCTURAL" in flags[0]["reason"]
+
+    def test_structural_argument_passes(self):
+        assert scan_scope_dodge(self.STRUCTURAL) == []
+
+    def test_no_feasibility_negation_passes(self):
+        assert scan_scope_dodge(self.FEASIBLE) == []
+
+    def test_missing_scope_section_passes(self):
+        assert scan_scope_dodge("# T\n\n## FINDINGS\n\nbody") == []
+
+
+class TestProvenanceAppendix:
+    def test_renders_stage_funnel_and_queries(self):
+        md = _render_provenance_section({
+            "identified_records": 120, "post_dedup": 90, "post_selection": 24,
+            "post_enrichment": 31, "canonical_backfilled": 7, "final_sources": 12,
+            "tier_breakdown": {"P1": 10, "P2": 2}, "web_records_kept": 3,
+            "evidence": {"chunks": 97, "fetched_sources": 8, "total_chars": 131000,
+                         "semantic_scoring": False},
+            "queries": ["main query", "keyword rewrite"], "pruned_uncited": [4, 9],
+            "citation_precision": 1.0, "claim_coverage": 0.9,
+        })
+        assert "## METHODOLOGY & PROVENANCE" in md
+        assert "Records identified (live APIs + RAG + web) | 120" in md
+        assert "Final pool by source tier | P1: 10, P2: 2" in md
+        assert "Grey-literature web records in final pool | 3" in md
+        assert "| Uncited sources pruned | 2 |" in md
+        assert "- keyword rewrite" in md
+        assert "keyword fallback" in md
+
+    def test_minimal_provenance_renders_without_optional_rows(self):
+        md = _render_provenance_section({"identified_records": 5})
+        assert "## METHODOLOGY & PROVENANCE" in md
+        assert "Grey-literature" not in md
+        assert "Uncited sources pruned" not in md
+
+
+class TestCritiqueReviseCritiqueFixes:
+    def test_scope_and_news_flags_enter_revision_feedback(self, monkeypatch):
+        import asyncio
+        import agent.llm_router as lr
+        import agent.research_engine as re_mod
+
+        report = (
+            "# T\n\n## SCOPE & EVIDENCE BASE\n\nA direct meta-analysis of this "
+            "question cannot be performed with the evidence retrieved here.\n\n"
+            "## FINDINGS\n\nNegative data were often considered unimportant in "
+            "trials [S1]. Under moderate bias false positive rates can approach "
+            "100% [S2]. More padding prose follows so the revision threshold "
+            "check has a reasonable-length report to work with here.\n\n"
+            "## SOURCES\n\n[S1] [P3] Daily news. Why results go unreported.\n"
+            "[S2] [P1] Educational research publication bias study.\n"
+            "[S3] [P1] Publication bias in clinical trials: negative trials are "
+            "less likely to be published."
+        )
+
+        async def fake_router(**kwargs):
+            ctx = kwargs.get("context", "")
+            if "FLAGGED ISSUES" in ctx:
+                return SimpleNamespace(content=report, model_name="mock")
+            return SimpleNamespace(content='{"issues": []}', model_name="mock")
+
+        monkeypatch.setattr(lr, "synthesize_with_router", fake_router)
+        sources = [
+            {"title": "Why negative study results go unreported",
+             "snippet": "negative data were often considered unimportant in trials",
+             "tier": "P3", "url": "https://www.pulmonologyadvisor.com/a.html"},
+            {"title": "Neglect of publication bias compromises meta-analyses of educational research",
+             "snippet": "simulation of moderate publication bias",
+             "tier": "P1", "url": "https://doi.org/10.1111/edu"},
+            {"title": "Publication bias in clinical trials: negative trials are less likely to be published",
+             "snippet": "unpublished negative trial data remain inaccessible",
+             "tier": "P1", "url": "https://doi.org/10.1111/clin"},
+        ]
+        text, summary, _ = asyncio.run(
+            re_mod._critique_and_revise(report, "q", sources, "quick")
+        )
+        assert summary["scope_flags"] == 1
+        assert summary["news_flags"] == 1
+        assert summary["domain_flags"] == 1
+        assert summary["revised"] is True
