@@ -16,6 +16,40 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 
+# ── Generic-academic vocabulary (padding detection) ──
+# Words that appear in ANY methods paper's title/abstract regardless of
+# subject. Live run8 failure: the query "Meta-analysis of unpublished
+# negative-result trials ... public databases" shares {meta, analysis,
+# public, database} with "Meta-analysis of hypoxic transcriptomes from
+# public databases" (RNA-seq) and "Federated Learning in Distributed Medical
+# Databases" (brain imaging) — zero overlap with the DISCRIMINATIVE core
+# (unpublished/negative/result/trial) — yet both passed the relevance gate
+# and got cited, one even rationalized into the scope argument. Core overlap
+# that reduces to generic terms is NOT topical purchase.
+GENERIC_ACADEMIC_TERMS = {
+    "meta", "analysis", "analyses", "systematic", "review", "scoping",
+    "study", "studies", "research", "evidence", "public", "database",
+    "databases", "data", "method", "methods", "methodological",
+    "methodology", "literature", "survey", "overview", "report",
+    "reports", "clinical", "health", "medical", "medicine", "science",
+    "scientific", "paper", "papers", "approach", "approaches", "framework",
+    "based", "using", "toward", "towards", "large", "scale", "real",
+    "world", "new", "novel", "comparative",
+}
+
+
+def discriminative_vocab(core_vocab: set) -> set:
+    """Core-question words that actually distinguish topic from non-topic:
+    core vocabulary minus generic academic terms."""
+    return {w for w in (core_vocab or set()) if w not in GENERIC_ACADEMIC_TERMS}
+
+
+def shared_terms(source: Dict, vocab: set) -> set:
+    """Which of `vocab` appear in the source's title+snippet (for audits)."""
+    text = f"{(source.get('title') or '')} {(source.get('snippet') or '')}".lower()
+    return {w for w in vocab if w in text}
+
+
 # Numbered citations: [S2], [2], [3,5], [S2, S3], [S2, S3, S5] — brackets
 # REQUIRED; the S prefix may appear on the first element or on every element
 NUMBERED_CITATION = re.compile(r'\[S?(\d{1,3}(?:\s*,\s*S?\d{1,3})*)\]')
@@ -607,6 +641,57 @@ def scan_news_tier_citations(
                 })
                 break
 
+    return flags
+
+
+# ── Off-topic padding scan ──────────────────────────────────────────
+# Live failure (run8 verdict): "Meta-analysis of hypoxic transcriptomes from
+# public databases" (RNA-seq) and "Federated Learning in Distributed Medical
+# Databases" (brain imaging) were SELECTED and CITED for a question about
+# unpublished negative-result TRIALS — keyword collision on generic academic
+# vocabulary, zero overlap with the discriminative core. The drafter then
+# rationalized one into the scope argument, which is how padding becomes
+# fake evidence.
+def scan_off_topic_padding(query: str, sources: List[Dict]) -> List[Dict]:
+    """Flag selected sources with ZERO discriminative overlap with the query.
+
+    A source whose title+snippet shares none of the query's discriminative
+    vocabulary (core content words minus generic academic terms) cannot be
+    evidence about the question; whatever the drafter says about it is
+    padding. Exemptions: canonical/backfilled sources (registry-attested
+    in-domain by construction) and records without any title at all.
+
+    Deterministic — no LLM, no thresholds to tune.
+    """
+    # Lazy import: engine imports this module at load time, so the cycle is
+    # broken by deferring; by call time the engine is fully initialized.
+    # _content_words = same stopword + plural-normalization machinery the
+    # selection-time relevance gate uses — scan and gate must agree.
+    from agent.research_engine import _content_words  # noqa: E402
+    disc = discriminative_vocab(_content_words(query))
+    flags: List[Dict] = []
+    if not disc:
+        return flags
+    for i, s in enumerate(sources, 1):
+        if s.get("canonical_id") or s.get("backfilled"):
+            continue
+        title = (s.get("title") or "").strip()
+        if not title:
+            continue
+        hits = shared_terms(s, disc)
+        if not hits:
+            flags.append({
+                "source": i,
+                "title": title[:120],
+                "url": (s.get("url") or "")[:120],
+                "reason": (
+                    "source shares none of the question's discriminative "
+                    "vocabulary — selected on generic-academic keyword "
+                    "collision; it cannot be evidence about this question and "
+                    "must not be cited (remove citations to it and any "
+                    "sentences built on it)"
+                ),
+            })
     return flags
 
 

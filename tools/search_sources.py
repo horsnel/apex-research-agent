@@ -462,7 +462,10 @@ async def search_clinical_trials(
                 params={
                     "query.term": safe_query,
                     "pageSize": max_results,
-                    "fields": "protocolSection.identificationModule,protocolSection.statusModule,protocolSection.designModule",
+                    # Flat LEAF field names (live-verified v2). The original
+                    # dotted module paths 400'd on EVERY call — this provider
+                    # silently returned [] in every run until run9 caught it.
+                    "fields": "NCTId|BriefTitle|OverallStatus|HasResults|StartDate|BriefSummary",
                 },
             )
             r.raise_for_status()
@@ -474,21 +477,36 @@ async def search_clinical_trials(
             ident = proto.get("identificationModule", {})
             status = proto.get("statusModule", {})
             design = proto.get("designModule", {})
+            desc = proto.get("descriptionModule", {})
             
             nct_id = ident.get("nctId", "")
             title = ident.get("briefTitle", "Untitled")
             overall_status = status.get("overallStatus", "")
             phase = design.get("phases", [])
+            # Top-level per-study flag (live-verified v2 shape): hasResults=False
+            # + COMPLETED status = the never-reported-trials phenomenon — the
+            # exact registry-level evidence keyword retrieval cannot see.
+            has_results = study.get("hasResults")
+            brief = re.sub(r"\s+", " ", str(desc.get("briefSummary") or "")).strip()
+            snippet = (
+                f"Status: {overall_status}. Phase: {', '.join(phase) if phase else 'N/A'}. "
+                f"Results posted: {'yes' if has_results else 'NO' if has_results is False else 'unknown'}. "
+                f"NCT: {nct_id}."
+                + (f" {brief[:500]}" if brief else "")
+            )
             
             results.append(SearchResult(
                 title=title,
                 url=f"https://clinicaltrials.gov/study/{nct_id}",
-                snippet=f"Status: {overall_status}. Phase: {', '.join(phase) if phase else 'N/A'}. NCT: {nct_id}",
+                snippet=snippet,
                 source_name="clinical_trials",
                 source_category=SourceCategory.CLINICAL,
                 source_tier="P1",
                 published_date=status.get("startDateStruct", {}).get("date"),
-                extra={"nct_id": nct_id, "status": overall_status, "phase": phase},
+                extra={
+                    "nct_id": nct_id, "status": overall_status, "phase": phase,
+                    "has_results": has_results, "registry": "clinicaltrials_gov",
+                },
             ))
         
         return results

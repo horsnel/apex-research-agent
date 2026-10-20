@@ -331,6 +331,15 @@ def _content_words(text: str) -> set:
     return {_normalize_term(w) for w in words if w not in _STOPWORDS}
 
 
+# ── Generic-academic vocabulary lives in citation_integrity (shared with
+# scan_off_topic_padding); imported there to keep one source of truth.
+from agent.citation_integrity import (  # noqa: E402
+    GENERIC_ACADEMIC_TERMS,
+    discriminative_vocab as _discriminative_vocab,
+    shared_terms as _source_shared_terms,
+)
+
+
 def _source_relevance(source: Dict, query_vocab: set) -> float:
     """Fraction of query content words appearing in the source title+snippet."""
     if not query_vocab:
@@ -388,6 +397,7 @@ def select_diverse_sources(
     query_variants: Optional[List[str]] = None,
     min_relevance: float = 0.15,
     relevance_floor: int = 5,
+    screening: Optional[Dict] = None,
 ) -> List[Dict]:
     """
     Report-grade source selection: preserve BREADTH instead of hard-truncating
@@ -436,29 +446,43 @@ def select_diverse_sources(
             f"Junk filter: dropped {pre_junk - len(sources)} non-paper sources "
             f"(supplement/figure records, bare-directory URLs)"
         )
+    if screening is not None:
+        screening["junk_filtered"] = pre_junk - len(sources)
 
     # ── Pass 0: relevance gate ──
     dropped_irrelevant = 0
     if query:
         core_vocab = _content_words(query)
+        disc_vocab = _discriminative_vocab(core_vocab)
         vocab = set(core_vocab)
         for v in (query_variants or []):
             vocab |= _content_words(v)
         if vocab:
             def _gated_relevance(s: Dict) -> float:
-                """Core-question relevance, with an expansion fallback only
-                for zero-core-overlap sources.
+                """Core-question relevance with DISCRIMINATIVE authority.
 
-                The CORE question is what a source must answer; expansion
-                variants merely corroborate. Union-vocab scoring alone let
-                jargon-matching padding (SEO pages, method-blog prose) pass
-                at 0.17 while the page carrying the question's actual
-                empirics scored 0.13 and died — the live run7 finding, and
-                the exact 'keyword hits, not answers' failure class. A pure
-                max(core, 0.6*full) blend still lets dense-jargon pages
-                outweigh weak-but-real core matches, so the fallback lane
-                is reserved for sources with NO core overlap at all.
+                Two rules stack:
+                1. Core-question authority (run7 repair): sources sharing any
+                   core vocabulary score on core vocab alone; zero-core
+                   sources fall to 0.6× expansion-vocab.
+                2. Discriminative authority (run8 repair): core overlap that
+                   reduces ENTIRELY to generic academic terms ({meta,
+                   analysis, public, database, ...}) is zero topical
+                   purchase. "Meta-analysis of hypoxic transcriptomes from
+                   public databases" shares 4 core words with "Meta-analysis
+                   of unpublished negative-result trials ... public
+                   databases" and shares NONE of {unpublished, negative,
+                   result, trial} — it must not ride the core lane.
+
+                A source with zero discriminative overlap scores 0.0 (the
+                expansion lane is NOT opened for it — the expansion vocab is
+                academic paraphrase and generic-dense jargon would re-admit
+                exactly this class). Canonical backfill happens AFTER
+                selection, so registry-attested sources are unaffected here.
                 """
+                if disc_vocab:
+                    if not _source_shared_terms(s, disc_vocab):
+                        return 0.0
                 core_rel = _source_relevance(s, core_vocab) if core_vocab else 0.0
                 if core_rel > 0:
                     return core_rel
@@ -467,6 +491,7 @@ def select_diverse_sources(
             scored = [(_gated_relevance(s), s) for s in sources]
             kept = [s for rel, s in scored if rel >= min_relevance]
             dropped_irrelevant = len(sources) - len(kept)
+            floor_rescued: List[Dict] = []
             if len(kept) < relevance_floor:
                 # Top up with the highest-relevance rejects (not highest-score)
                 by_rel = sorted(scored, key=lambda t: t[0], reverse=True)
@@ -477,11 +502,28 @@ def select_diverse_sources(
                     if id(s) not in seen:
                         kept.append(s)
                         seen.add(id(s))
+                        if rel < min_relevance:
+                            floor_rescued.append(s)
                 kept = kept[:relevance_floor]
+            if screening is not None:
+                screening["relevance_kept"] = len(kept)
+                screening["relevance_rejected"] = [
+                    {
+                        "title": (s.get("title") or "")[:120],
+                        "url": (s.get("url") or "")[:120],
+                        "relevance": round(rel, 3),
+                    }
+                    for rel, s in sorted(scored, key=lambda t: t[0])
+                    if rel < min_relevance and not any(s is k for k in kept)
+                ][:10]
+                screening["floor_rescued"] = [
+                    {"title": (s.get("title") or "")[:120]} for s in floor_rescued
+                ]
             if dropped_irrelevant:
                 logger.info(
                     f"Relevance gate: dropped {dropped_irrelevant} low-relevance "
-                    f"sources (core_vocab={len(core_vocab)}, full_vocab={len(vocab)}, "
+                    f"sources (core_vocab={len(core_vocab)}, "
+                    f"discriminative={len(disc_vocab)}, full_vocab={len(vocab)}, "
                     f"threshold={min_relevance})"
                 )
             sources = kept
@@ -1295,6 +1337,47 @@ async def _web_sources_for_report(
     else:
         stats["search_mode"] = "live"
 
+    # ── ClinicalTrials.gov registry lane (infrastructure the academic fan-out
+    # lacks entirely — Elicit's differentiator for trial questions). One
+    # keyless query against the official registry; records carry
+    # has_results so the pool can distinguish never-reported trials.
+    # Degradation is silent ([]), never fatal.
+    try:
+        from tools.search_sources import search_clinical_trials, canonicalize_web_url
+        # Registry-natural query: trial records never describe themselves as
+        # "unpublished" — searching the academic rewrite ("Meta-analysis
+        # unpublished ... databases") matches nothing. Query the registry
+        # with the question's DISCRIMINATIVE domain words only, then let the
+        # hasResults=False annotation identify never-reported trials.
+        reg_words = [
+            w for w in re.findall(r"[a-z0-9]{4,}", (query or "").lower())
+            if w not in GENERIC_ACADEMIC_TERMS and w not in _STOPWORDS
+        ]
+        reg_query = " ".join(dict.fromkeys(reg_words))[:200] or queries[0]
+        reg_rows = await search_clinical_trials(reg_query, 8)
+        reg_kept = 0
+        for r in reg_rows:
+            u = canonicalize_web_url(getattr(r, "url", ""))
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            flat.append(SimpleNamespace(
+                url=u,
+                title=getattr(r, "title", "") or u,
+                snippet=getattr(r, "snippet", "") or "",
+                source_name="clinical_trials",
+                source_tier=getattr(r, "source_tier", "") or "P1",
+                published_date=getattr(r, "published_date", "") or "",
+                extra=dict(getattr(r, "extra", {}) or {}, web=True, registry=True),
+            ))
+            reg_kept += 1
+        stats["registry_records"] = reg_kept
+        stats["registry_no_results"] = sum(
+            1 for r in reg_rows if getattr(r, "extra", {}).get("has_results") is False
+        )
+    except Exception as e:
+        logger.debug(f"ClinicalTrials.gov lane failed (non-fatal): {e}")
+
     out: List[Dict] = []
     for r in flat:
         out.append({
@@ -1904,6 +1987,7 @@ async def _critique_and_revise(
         check_report_citations, scan_claim_source_alignment,
         scan_concept_boundary_mismatch, scan_domain_generalization,
         scan_news_tier_citations, scan_scope_dodge,
+        scan_off_topic_padding,
     )
     from agent.canonical_sources import scan_canonical_method_usage
 
@@ -1913,6 +1997,7 @@ async def _critique_and_revise(
     domain_flags = scan_domain_generalization(report_text, sources)
     news_flags = scan_news_tier_citations(report_text, sources)
     scope_flags = scan_scope_dodge(report_text)
+    padding_flags = scan_off_topic_padding(query, sources)
     canonical_issues = scan_canonical_method_usage(report_text, sources)
     critique_summary = {
         "citation_precision": citation_report.citation_precision,
@@ -1924,6 +2009,7 @@ async def _critique_and_revise(
         "domain_flags": len(domain_flags),
         "news_flags": len(news_flags),
         "scope_flags": len(scope_flags),
+        "padding_flags": len(padding_flags),
         "canonical_issues": len(canonical_issues),
         "llm_issues": 0,
         "revised": False,
@@ -1947,6 +2033,9 @@ async def _critique_and_revise(
         ] + [
             {"source": f["source"], "excerpt": f["excerpt"], "reason": f.get("reason", "")}
             for f in news_flags
+        ] + [
+            {"source": f["source"], "excerpt": f["title"], "reason": f.get("reason", "")}
+            for f in padding_flags
         ]
         if mechanical_flags:
             pairs = "\n".join(
@@ -2000,6 +2089,10 @@ Find the worst hallucinated citations, missing citations, and unsupported superl
         f"[NEWS_TIER_CITATION] [S{f['source']}] “{f['excerpt']}” — {f['reason']}"
         for f in news_flags
     ]
+    padding_issue_strs = [
+        f"[OFF_TOPIC_PADDING] [S{f['source']}] {f['title']} — {f['reason']}"
+        for f in padding_flags
+    ]
     all_issues = (
         list(extra_issues or [])
         + list(citation_report.issues)
@@ -2007,6 +2100,7 @@ Find the worst hallucinated citations, missing citations, and unsupported superl
         + scope_issue_strs
         + domain_issue_strs
         + news_issue_strs
+        + padding_issue_strs
         + [f"[{i.get('type')}] {i.get('detail')} → {i.get('fix')}" for i in llm_issues]
     )
 
@@ -2114,9 +2208,52 @@ def _render_provenance_section(provenance: Dict) -> str:
     pruned = provenance.get("pruned_uncited") or []
     if pruned:
         lines.append(f"| Uncited sources pruned | {len(pruned)} |")
+    # Metrics that refuse to lie: relevance precision sits next to citation
+    # precision so a clean "1.0" can never again hide dead-weight sources;
+    # claim coverage below 0.6 gets an explicit warning, not a silent number.
+    rel_prec = provenance.get("relevance_precision")
+    if rel_prec is not None:
+        lines.append(f"| Citation precision (structural) | {provenance.get('citation_precision', 'n/a')} |")
+        lines.append(f"| Relevance precision (topical, padding-aware) | {rel_prec} |")
+        pad_cited = provenance.get("padding_cited") or []
+        if pad_cited:
+            lines.append(f"| ⚠ Cited sources with zero discriminative overlap | {len(pad_cited)} ([S{'], [S'.join(str(x) for x in pad_cited)}]) |")
+    cov = provenance.get("claim_coverage")
+    if cov is not None and cov != "n/a":
+        try:
+            if float(cov) < 0.6:
+                lines.append(f"| ⚠ Claim coverage below 0.60 — {cov} of body claims verified against retrieved source text; treat unverified claims as provisional |  |")
+        except (TypeError, ValueError):
+            pass
     lines += ["", "Queries executed:"]
     for q in provenance.get("queries", []):
         lines.append(f"- {q}")
+
+    # Screening decisions — WHICH records were excluded and WHY (the
+    # "counter table can't tell you what was screened out" gap).
+    scr = provenance.get("screening") or {}
+    rej = scr.get("relevance_rejected") or []
+    resc = scr.get("floor_rescued") or []
+    pad_drop = scr.get("padding_dropped") or []
+    pruned_uncited = provenance.get("pruned_uncited") or []
+    if any([rej, resc, pad_drop, scr.get("junk_filtered"), pruned_uncited]):
+        lines += ["", "Screening decisions (deterministic, auditable):"]
+        if scr.get("junk_filtered"):
+            lines.append(f"- Junk filter: {scr['junk_filtered']} non-paper records dropped (supplements, bare directories)")
+        if rej:
+            shown = "; ".join(
+                f"“{(r.get('title') or '')[:70]}” ({r.get('relevance', 0)})"
+                for r in rej[:5]
+            )
+            lines.append(f"- Relevance gate: kept {scr.get('relevance_kept', '?')}, rejected {len(rej)} — lowest scores: {shown}")
+        if resc:
+            shown = "; ".join(f"“{(r.get('title') or '')[:70]}”" for r in resc[:4])
+            lines.append(f"- Floor rescue: {len(resc)} re-admitted below threshold to avoid an empty pool: {shown}")
+        if pad_drop:
+            shown = "; ".join(f"“{(t or '')[:70]}”" for t in pad_drop[:5])
+            lines.append(f"- Off-topic padding: {len(pad_drop)} sources with zero discriminative overlap removed before drafting: {shown}")
+        if pruned_uncited:
+            lines.append(f"- Dead-source pruning: {len(pruned_uncited)} pool members the final text never cited")
     return "\n".join(lines) + "\n"
 
 
@@ -2209,11 +2346,13 @@ async def generate_research_report(
     # ── Step 3: Canonical dedup → diverse selection → domain-aware decay ──
     all_sources = dedup_sources_canonical(all_sources)
     funnel["post_dedup"] = len(all_sources)
+    screening: Dict = {}  # deterministic screening-decision audit (provenance)
     all_sources = select_diverse_sources(
         all_sources,
         max_sources=28 if depth == "thorough" else 18,
         query=query,
         query_variants=variants,
+        screening=screening,
     )
     funnel["post_selection"] = len(all_sources)
 
@@ -2227,6 +2366,7 @@ async def generate_research_report(
                 max_sources=30,
                 query=query,
                 query_variants=variants,
+                screening=screening,
             )
 
     # ── Step 5: Iterative gap-filling (thorough, verification-driven) ──
@@ -2245,6 +2385,7 @@ async def generate_research_report(
                 max_sources=30,
                 query=query,
                 query_variants=variants,
+                screening=screening,
             )
 
     # ── Step 5.5: CANONICAL-SOURCE BACKFILL (registry-verified, deterministic) ──
@@ -2272,6 +2413,31 @@ async def generate_research_report(
         logger.warning(f"Canonical backfill failed (non-fatal): {e}")
     funnel["post_enrichment"] = len(all_sources)
     funnel["canonical_backfilled"] = len(backfilled_ids)
+
+    # ── Step 5.6: OFF-TOPIC PADDING DROP (deterministic, pre-draft) ──
+    # Sources sharing NONE of the query's discriminative vocabulary cannot
+    # be evidence about the question — citing them is padding (run8: RNA-seq
+    # and brain-imaging meta-analyses cited for an unpublished-trials
+    # question, one rationalized into the scope argument). Canonical-
+    # backfilled sources are exempt (registry-attested in-domain). Dropping
+    # BEFORE drafting beats flagging after: the drafter can't rationalize
+    # padding into arguments it never sees.
+    try:
+        from agent.citation_integrity import scan_off_topic_padding
+        padding_pre = scan_off_topic_padding(query, all_sources)
+        if padding_pre:
+            drop_idx = {f["source"] for f in padding_pre}
+            screening["padding_dropped"] = [f["title"] for f in padding_pre]
+            all_sources = [
+                s for i, s in enumerate(all_sources, 1) if i not in drop_idx
+            ]
+            funnel["padding_dropped"] = len(padding_pre)
+            logger.info(
+                f"Padding drop: removed {len(padding_pre)} zero-discriminative-"
+                f"overlap sources pre-draft: {[f['title'][:60] for f in padding_pre]}"
+            )
+    except Exception as e:
+        logger.warning(f"Padding drop failed (non-fatal): {e}")
 
     if not all_sources:
         # Absolute fallback: single-call generation on empty evidence
@@ -2392,6 +2558,30 @@ async def generate_research_report(
             f"{prune_stats['before']} → {prune_stats['after']} (renumbered)"
         )
 
+    # ── Step 10.55: RELEVANCE HONESTY (metrics that can't lie) ──
+    # citation_precision counts numbering/decency, not topicality — run8's
+    # "1.0" sat next to two irrelevant sources. Relevance precision counts
+    # only citations whose source carries discriminative overlap with the
+    # question. Claim coverage below 0.6 becomes an explicit appendix line,
+    # never a silent number.
+    try:
+        from agent.citation_integrity import scan_off_topic_padding as _sop
+        from agent.citation_integrity import extract_numbered_citations as _enc
+        padding_final = _sop(query, all_sources)
+        critique["padding_flags_final"] = len(padding_final)
+        body_split = re.split(r"\n##\s+SOURCES\b", raw_report, maxsplit=1, flags=re.I)
+        cited_final = sorted(set(_enc(body_split[0])))
+        padding_cited = {f["source"] for f in padding_final if f["source"] in cited_final}
+        critique["padding_cited"] = sorted(padding_cited)
+        critique["relevance_precision"] = (
+            round(1.0 - len(padding_cited) / len(cited_final), 3)
+            if cited_final else None
+        )
+    except Exception as e:
+        logger.debug(f"Relevance-honesty metrics failed (non-fatal): {e}")
+        critique["padding_flags_final"] = None
+        critique["relevance_precision"] = None
+
     # ── Step 10.6: PROVENANCE APPENDIX (deterministic audit trail) ──
     # PRISMA-style funnel rendered from pipeline counters — nothing after
     # this point rewrites the text, so the appendix stays consistent.
@@ -2422,7 +2612,20 @@ async def generate_research_report(
             ],
             "pruned_uncited": prune_stats.get("pruned", []),
             "citation_precision": critique.get("citation_precision"),
+            "relevance_precision": critique.get("relevance_precision"),
+            "padding_cited": critique.get("padding_cited", []),
             "claim_coverage": critique.get("claim_coverage"),
+            "screening": {
+                "relevance_kept": screening.get("relevance_kept"),
+                "relevance_rejected": screening.get("relevance_rejected", []),
+                "floor_rescued": screening.get("floor_rescued", []),
+                "padding_dropped": screening.get("padding_dropped", []),
+                "junk_filtered": funnel.get("junk_filtered"),
+            },
+            "registry": {
+                "records": (web_stats or {}).get("registry_records", 0),
+                "no_results_records": (web_stats or {}).get("registry_no_results", 0),
+            },
         }
         raw_report = raw_report.rstrip("\n") + _render_provenance_section(provenance)
 

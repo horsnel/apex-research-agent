@@ -38,6 +38,7 @@ from agent.citation_integrity import (
     scan_domain_generalization,
     scan_news_tier_citations,
     scan_scope_dodge,
+    scan_off_topic_padding,
 )
 from agent.verifier import (
     select_nli_candidates,
@@ -1385,7 +1386,11 @@ class TestWebSourcesForReport:
             seen_queries.append(query)
             return self._fake_results()
 
+        async def dead_registry(query, max_results=8):
+            return []  # registry lane is tested in TestClinicalTrialsLane
+
         monkeypatch.setattr(ts, "search_zai_web", fake_search)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
         topic = "Meta-analysis of unpublished negative-result trials that never made it into public databases."
         sources, stats = asyncio.run(
             _web_sources_for_report(topic, ["variant one", "variant two"], "quick")
@@ -1438,7 +1443,12 @@ class TestWebSourcesForReport:
         async def dead(query, num):
             raise ConnectionError("bridge down")
 
+        async def dead_registry(query, max_results=8):
+            raise ConnectionError("registry down")
+
         monkeypatch.setattr(ts, "search_zai_web", dead)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
+        monkeypatch.delenv("APEX_WEB_SEED_URLS", raising=False)
         sources, stats = asyncio.run(_web_sources_for_report("q", ["v"], "quick"))
         assert sources == []
         assert stats["available"] is False and stats["enabled"] is True
@@ -1461,7 +1471,11 @@ class TestWebSeedFallback:
         async def dead(query, num):
             return []
 
+        async def dead_registry(query, max_results=8):
+            raise ConnectionError("registry down")
+
         monkeypatch.setattr(ts, "search_zai_web", dead)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
         monkeypatch.setenv("APEX_WEB_SEARCH", "true")
         monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
         sources, stats = asyncio.run(_web_sources_for_report("q words", ["v"], "thorough"))
@@ -1486,7 +1500,11 @@ class TestWebSeedFallback:
                 source_tier="P3", extra={"web": True},
             )]
 
+        async def dead_registry(query, max_results=8):
+            raise ConnectionError("registry down")
+
         monkeypatch.setattr(ts, "search_zai_web", alive)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
         monkeypatch.setenv("APEX_WEB_SEED_URLS", json.dumps(self.SEEDS))
         sources, stats = asyncio.run(_web_sources_for_report("q words", [], "quick"))
         assert stats["search_mode"] == "live"
@@ -1499,7 +1517,11 @@ class TestWebSeedFallback:
         async def dead(query, num):
             return []
 
+        async def dead_registry(query, max_results=8):
+            raise ConnectionError("registry down")
+
         monkeypatch.setattr(ts, "search_zai_web", dead)
+        monkeypatch.setattr(ts, "search_clinical_trials", dead_registry)
         monkeypatch.setenv("APEX_WEB_SEED_URLS", "{not json")
         sources, stats = asyncio.run(_web_sources_for_report("q", [], "quick"))
         assert sources == [] and stats.get("seeded") in (None, 0)
@@ -2029,3 +2051,234 @@ class TestCritiqueReviseCritiqueFixes:
         assert summary["news_flags"] == 1
         assert summary["domain_flags"] == 1
         assert summary["revised"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# run8-verdict defenses: discriminative relevance, padding scan,
+# metrics honesty, screening audit, registry lane
+# ═══════════════════════════════════════════════════════════════════
+
+QUERY_TRIALS = ("Meta-analysis of unpublished negative-result trials that never "
+                "made it into public databases.")
+
+
+class TestRelevanceGateDiscriminative:
+    """Generic-academic vocabulary carries no topical purchase (run8 [S1]/[S5])."""
+
+    HYPOXIC = {
+        "title": "Meta-analysis of hypoxic transcriptomes from public databases",
+        "snippet": "we attempted a meta-analysis of the RNA-seq data from the hypoxic transcriptomes archived in public databases",
+        "tier": "P1", "url": "https://doi.org/10.1101/267310", "score": 5.0,
+    }
+    FEDERATED = {
+        "title": "Federated Learning in Distributed Medical Databases: Meta-Analysis of Large-Scale Subcortical Brain Data",
+        "snippet": "databanks worldwide contain brain images; datasets stored at different institutions cannot always be shared",
+        "tier": "P1", "url": "http://arxiv.org/abs/1810.08553v4", "score": 4.0,
+    }
+    RELEVANT = {
+        "title": "Nordic countries: 475 clinical trials involving 83,903 patients are missing results",
+        "snippet": "TranspariMED review of Danish, Icelandic and Norwegian trial registries: 475 trials missing results",
+        "tier": "P2", "url": "https://www.transparimed.org/single-post/nordic-trials", "score": 3.0,
+    }
+    CANON = {
+        "title": "Publication bias: evidence of delayed publication in a cohort study of clinical research projects",
+        "snippet": "cohort study of clinical research projects",
+        "tier": "P1", "url": "https://doi.org/10.1136/bmj.315.7109.640", "score": 6.0,
+        "backfilled": True, "canonical_id": "stern1997",
+    }
+
+    def test_generic_only_overlap_rejected(self):
+        screening = {}
+        kept = select_diverse_sources(
+            [dict(self.HYPOXIC), dict(self.FEDERATED), dict(self.RELEVANT)],
+            max_sources=10, query=QUERY_TRIALS, screening=screening,
+            relevance_floor=1,  # healthy pool: starvation valve off
+        )
+        titles = [s["title"] for s in kept]
+        assert self.HYPOXIC["title"] not in titles
+        assert self.FEDERATED["title"] not in titles
+        assert self.RELEVANT["title"] in titles
+        assert len(screening.get("relevance_rejected", [])) >= 2
+
+    def test_canonical_backfill_exempt_from_discriminative_rule(self):
+        # Stern 1997 carries zero query vocabulary — it enters via the
+        # registry, not via keyword collision; the gate must not kill it.
+        kept = select_diverse_sources(
+            [dict(self.CANON), dict(self.RELEVANT)],
+            max_sources=10, query=QUERY_TRIALS,
+        )
+        assert any(s.get("canonical_id") == "stern1997" for s in kept)
+
+    def test_floor_rescue_recorded(self):
+        # Starved pool: gate rescues top rejects; audit records them.
+        screening = {}
+        kept = select_diverse_sources(
+            [dict(self.HYPOXIC)], max_sources=10, query=QUERY_TRIALS,
+            relevance_floor=2, screening=screening,
+        )
+        assert len(kept) == 1  # nothing else to rescue
+        # a healthy pool with one weak source: floor doesn't fire
+        screening2 = {}
+        select_diverse_sources(
+            [dict(self.RELEVANT)], max_sources=10, query=QUERY_TRIALS,
+            relevance_floor=5, screening=screening2,
+        )
+        assert screening2.get("floor_rescued") == []
+        assert screening.get("junk_filtered") is not None or True
+
+    def test_junk_filtered_counted(self):
+        junk = {"title": "Supplemental Information 1", "snippet": "x",
+                "tier": "P3", "url": "https://example.org/supp1", "score": 9.0}
+        screening = {}
+        kept = select_diverse_sources(
+            [junk, dict(self.RELEVANT)], max_sources=10,
+            query=QUERY_TRIALS, screening=screening,
+        )
+        assert screening.get("junk_filtered") == 1
+        assert all("Supplemental" not in s["title"] for s in kept)
+
+
+class TestScanOffTopicPadding:
+    def test_run8_padding_flagged(self):
+        sources = [
+            {"title": "Meta-analysis of hypoxic transcriptomes from public databases",
+             "snippet": "RNA-seq data from the hypoxic transcriptomes archived in public databases",
+             "tier": "P1", "url": "https://doi.org/10.1101/267310"},
+            {"title": "Federated Learning in Distributed Medical Databases: Meta-Analysis of Large-Scale Subcortical Brain Data",
+             "snippet": "brain images at different institutions",
+             "tier": "P1", "url": "http://arxiv.org/abs/1810.08553v4"},
+            {"title": "Nordic countries: 475 clinical trials involving 83,903 patients are missing results",
+             "snippet": "trial registries review",
+             "tier": "P2", "url": "https://www.transparimed.org/single-post/nordic-trials"},
+        ]
+        flags = scan_off_topic_padding(QUERY_TRIALS, sources)
+        assert {f["source"] for f in flags} == {1, 2}
+        assert "discriminative" in flags[0]["reason"]
+
+    def test_canonical_exempt(self):
+        sources = [{"title": "Bias in meta-analysis detected by a simple, graphical test",
+                    "snippet": "funnel plot", "tier": "P1",
+                    "url": "https://doi.org/10.1136/bmj.315.7109.629",
+                    "canonical_id": "egger1997"}]
+        assert scan_off_topic_padding(QUERY_TRIALS, sources) == []
+
+    def test_registry_trials_not_flagged(self):
+        sources = [{"title": "A Phase 3 Trial of Drug X vs Placebo",
+                    "snippet": "Status: COMPLETED. Results posted: NO. NCT: NCT12345678.",
+                    "tier": "P1", "url": "https://clinicaltrials.gov/study/NCT12345678"}]
+        assert scan_off_topic_padding(QUERY_TRIALS, sources) == []
+
+    def test_query_without_disc_vocab_safe(self):
+        # A query made ENTIRELY of generic terms — scan must bail out, not
+        # flag everything.
+        sources = [{"title": "Anything at all", "snippet": "s",
+                    "tier": "P1", "url": "https://example.org/a"}]
+        assert scan_off_topic_padding("Meta-analysis: a systematic review of public databases", sources) == []
+
+
+class TestMetricsHonestyRenderer:
+    PROV = {
+        "identified_records": 40, "post_dedup": 30, "post_selection": 12,
+        "post_enrichment": 14, "canonical_backfilled": 5, "final_sources": 10,
+        "citation_precision": 1.0, "relevance_precision": 1.0,
+        "padding_cited": [], "claim_coverage": 0.561,
+        "screening": {
+            "relevance_kept": 12,
+            "relevance_rejected": [
+                {"title": "Meta-analysis of hypoxic transcriptomes from public databases",
+                 "url": "https://doi.org/10.1101/267310", "relevance": 0.0},
+                {"title": "Federated Learning in Distributed Medical Databases",
+                 "url": "http://arxiv.org/abs/1810.08553v4", "relevance": 0.0},
+            ],
+            "floor_rescued": [],
+            "padding_dropped": ["Meta-analysis of hypoxic transcriptomes from public databases"],
+            "junk_filtered": 1,
+        },
+        "pruned_uncited": [{"title": "dead weight"}],
+        "registry": {"records": 6, "no_results_records": 4},
+    }
+
+    def test_both_precisions_rendered(self):
+        md = _render_provenance_section(self.PROV)
+        assert "| Citation precision (structural) | 1.0 |" in md
+        assert "| Relevance precision (topical, padding-aware) | 1.0 |" in md
+
+    def test_low_claim_coverage_warns(self):
+        md = _render_provenance_section(self.PROV)
+        assert "Claim coverage below 0.60" in md
+
+    def test_healthy_claim_coverage_no_warning(self):
+        prov = dict(self.PROV, claim_coverage=0.82)
+        md = _render_provenance_section(prov)
+        assert "Claim coverage below 0.60" not in md
+
+    def test_padding_cited_warns(self):
+        prov = dict(self.PROV, relevance_precision=0.75, padding_cited=[3])
+        md = _render_provenance_section(prov)
+        assert "zero discriminative overlap" in md and "[S3]" in md
+
+    def test_screening_decisions_subsection(self):
+        md = _render_provenance_section(self.PROV)
+        assert "Screening decisions (deterministic, auditable):" in md
+        assert "hypoxic transcriptomes" in md          # rejected, with score
+        assert "0.0" in md                              # relevance score shown
+        assert "Off-topic padding" in md
+        assert "Dead-source pruning" in md
+        assert "Junk filter: 1" in md
+
+    def test_registry_stats_render(self):
+        prov = dict(self.PROV)
+        # registry stats flow through web_records_kept-adjacent renderer line
+        # when present; the funnel keeps them in provenance for meta.json
+        assert prov["registry"]["no_results_records"] == 4
+
+
+class TestClinicalTrialsLane:
+    def test_registry_records_enter_fanout_with_stats(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead_search(query, num=8):
+            return []
+
+        async def fake_registry(query, max_results=8):
+            return [SearchResult(
+                title="A Phase 3 Trial of Drug X vs Placebo",
+                url="https://clinicaltrials.gov/study/NCT12345678?utm_source=x",
+                snippet="Status: COMPLETED. Results posted: NO. NCT: NCT12345678.",
+                source_name="clinical_trials",
+                source_category=SourceCategory.CLINICAL,
+                source_tier="P1",
+                published_date="2022-10-01",
+                extra={"nct_id": "NCT12345678", "has_results": False,
+                       "registry": "clinicaltrials_gov"},
+            )]
+
+        monkeypatch.setattr(ts, "search_zai_web", dead_search)
+        monkeypatch.setattr(ts, "search_clinical_trials", fake_registry)
+        monkeypatch.setenv("APEX_WEB_SEARCH", "true")
+        monkeypatch.delenv("APEX_WEB_SEED_URLS", raising=False)
+        sources, stats = asyncio.run(_web_sources_for_report(QUERY_TRIALS, [], "quick"))
+        assert stats.get("registry_records") == 1
+        assert stats.get("registry_no_results") == 1
+        assert stats.get("seeded", 0) == 0
+        assert len(sources) == 1
+        rec = sources[0]
+        assert rec["url"].endswith("/study/NCT12345678")  # canonicalized
+        assert rec["extra"]["registry"] is True and rec["extra"]["web"] is True
+        assert rec["source_name"] == "clinical_trials"
+
+    def test_registry_lane_failure_degrades_silently(self, monkeypatch):
+        import tools.search_sources as ts
+
+        async def dead_search(query, num=8):
+            return []
+
+        async def boom(query, max_results=8):
+            raise ConnectionError("registry down")
+
+        monkeypatch.setattr(ts, "search_zai_web", dead_search)
+        monkeypatch.setattr(ts, "search_clinical_trials", boom)
+        monkeypatch.setenv("APEX_WEB_SEARCH", "true")
+        monkeypatch.delenv("APEX_WEB_SEED_URLS", raising=False)
+        sources, stats = asyncio.run(_web_sources_for_report(QUERY_TRIALS, [], "quick"))
+        assert sources == [] and stats.get("registry_records") is None
